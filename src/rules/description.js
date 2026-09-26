@@ -3,7 +3,7 @@
  * Opis reguł: rules/02-opis.md
  *
  * Gemini zwraca wyłącznie treść (JSON, bez HTML). Strukturę – H1 z tytułem, nagłówki H2,
- * emoji, separatory, specyfikację i zdanie „Produkt nowy…” – dokłada buildDescription().
+ * emoji, opcjonalny separator, specyfikację i zdanie „Produkt nowy…” – dokłada buildDescription().
  *
  * Działa w Tampermonkey (window.AllegroDescriptionRules, np. przez @require)
  * oraz w Node (module.exports) – na potrzeby testów.
@@ -20,7 +20,8 @@
   const MAX_PARAGRAPH_CHARS = 200;
   const MAX_SECTION_CHARS = 600;
   const MAX_KEYWORD_REPEATS = 4;
-  const DEFAULT_SEPARATOR = '━'.repeat(20);
+  // Linia pod nagłówkami H2 – domyślnie wyłączona; włączenie: input.separator = SEPARATOR_LINE.
+  const SEPARATOR_LINE = '━'.repeat(20);
 
   // Emoji wyświetlane poprawnie na Allegro (pełna lista: https://allemoji.pl/).
   const ALLOWED_EMOJI = [
@@ -169,7 +170,7 @@
   function buildDescription(content, input) {
     content = content || {};
     input = input || {};
-    const sep = input.separator === undefined ? DEFAULT_SEPARATOR : input.separator;
+    const sep = input.separator || '';
     const heading = (emoji, text) => {
       const blocks = [h('h2', `${emoji} ${upper(stripLead(text))}`)];
       if (sep) blocks.push(h('p', sep));
@@ -403,7 +404,7 @@
 
     for (const s of description.sections) {
       if (s.id === 'faq' || s.id === 'hook') continue;
-      const body = s.blocks.filter((b) => b.type === 'p' && b.text !== DEFAULT_SEPARATOR && b.text !== input.separator);
+      const body = s.blocks.filter((b) => b.type === 'p' && !(input.separator && b.text === input.separator));
       const len = cp(body.map((b) => plain(b.text)).join(' '));
       if (len > MAX_SECTION_CHARS) warnings.push(`sekcja ${s.id}: ${len} znaków tekstu (max ${MAX_SECTION_CHARS}) – tekst nie może być większy niż zdjęcie`);
     }
@@ -543,7 +544,7 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
     MAX_PARAGRAPH_CHARS,
     MAX_SECTION_CHARS,
     ALLOWED_EMOJI,
-    DEFAULT_SEPARATOR,
+    SEPARATOR_LINE,
     NEW_PRODUCT_SENTENCE,
     IMAGE_HINTS,
     DESCRIPTION_SCHEMA,

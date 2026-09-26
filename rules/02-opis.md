@@ -17,7 +17,7 @@ szablonu:
 
 - stałe nagłówki,
 - emoji,
-- separatory,
+- opcjonalny separator (domyślnie wyłączony),
 - tytuł w H1,
 - zdanie „Produkt nowy…”.
 
@@ -87,8 +87,9 @@ Gemini ma ich w tekście nie dodawać.
 - **Nagłówki H2** – WIELKIMI LITERAMI, z jednym emoji na początku. Klienci
   skanują opis po nagłówkach, więc nagłówek mówi o **zalecie** produktu, a nie
   „Opis produktu”. Przykład: „✨ ROZWIJA WYOBRAŹNIĘ I SPRAWNE PALUSZKI”.
-- **Separator** – linia `━━━━━━━━━━━━━━━━━━━━` pod każdym nagłówkiem H2.
-  Można ją wyłączyć (`separator: ''`).
+- **Separator** – na razie **wyłączony**. W razie potrzeby można włączyć
+  linię `━━━━━━━━━━━━━━━━━━━━` pod każdym nagłówkiem H2
+  (`separator: SEPARATOR_LINE`).
 - **Rozstrzelony tekst** – tylko nagłówek specyfikacji: `⚙️ S P E C Y F I K A C J A`.
   Rozstrzelenie psuje wyszukiwanie słów, więc nie stosujemy go w innych
   nagłówkach.

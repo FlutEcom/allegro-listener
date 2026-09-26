@@ -55,9 +55,9 @@ test('szablon: H1 = tytuł, stałe nagłówki, specyfikacja, Q&A na końcu', () 
   assert.equal(sections.flatMap((s) => s.blocks).filter((b) => b.type === 'h1').length, 1);
   for (const s of sections.slice(1)) assert.equal(s.blocks[0].type, 'h2', s.id);
   assert.equal(sections[1].blocks[0].text, '⭐ CO ZYSKUJESZ?');
-  assert.equal(sections[1].blocks[2].text, '✔️ **Pancerne pudełko** ➡️ Wytrzyma lata zabawy. Nie musisz dokupować.');
+  assert.equal(sections[1].blocks[1].text, '✔️ **Pancerne pudełko** ➡️ Wytrzyma lata zabawy. Nie musisz dokupować.');
   assert.equal(sections[2].blocks[0].text, '✨ ROZWIJA WYOBRAŹNIĘ I SPRAWNE PALUSZKI');
-  assert.equal(sections[3].blocks[2].text, '1️⃣ 500 kolorowych koralików'); // zawartość od sprzedawcy
+  assert.equal(sections[3].blocks[1].text, '1️⃣ 500 kolorowych koralików'); // zawartość od sprzedawcy
   assert.equal(sections[4].blocks[0].text, '❄️ GOTOWY PREZENT POD CHOINKĘ');
   const spec = sections[5].blocks.map((b) => b.text);
   assert.equal(spec[0], '⚙️ S P E C Y F I K A C J A');
@@ -68,6 +68,13 @@ test('szablon: H1 = tytuł, stałe nagłówki, specyfikacja, Q&A na końcu', () 
   assert.equal(spec.at(-1), '✅ Produkt nowy, nieużywany, fabrycznie zapakowany.');
   assert.equal(sections[6].layout, 'TEXT');
   assert.equal(sections[6].blocks.at(-1).text, '❤️ Dziękujemy, że wybierasz nasze zabawki.');
+});
+
+test('separator: domyślnie brak, można włączyć', () => {
+  const blocks = (input) => D.buildDescription(good(), input).sections.flatMap((s) => s.blocks);
+  assert.ok(!blocks(INPUT).some((b) => b.text.includes('━')));
+  const withSep = D.buildDescription(good(), { ...INPUT, separator: D.SEPARATOR_LINE }).sections;
+  for (const s of withSep.slice(1)) assert.equal(s.blocks[1].text, D.SEPARATOR_LINE, s.id);
 });
 
 test('hook: social proof i promocja od sprzedawcy, ⬇️ w pierwszych 200 znakach', () => {
