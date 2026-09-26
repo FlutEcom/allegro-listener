@@ -37,6 +37,7 @@ const settings = {
 const state = {
   mode: null, // 'NEW' | 'CATALOG' – null = wybór automatyczny
   userPhotos: [], // [{mimeType, data, preview}]
+  removedFormUrls: new Set(), // zdjęcia z formularza usunięte w panelu
   form: { name: '', parameters: [], imageUrls: [] },
   result: null,
   searchQueries: [],
@@ -151,13 +152,24 @@ function readFormParameters() {
   return out;
 }
 
+// Logo i grafiki interfejsu Sales Center (też hostowane na allegroimg) – nie są zdjęciami produktu.
+const NOT_PRODUCT_IMAGE = /logo|sales[\s_-]?center|avatar|icon|ikon|banner/i;
+
+function isInterfaceImage(img, src) {
+  if (img.closest('header, nav, [role="banner"], [role="navigation"], [class*="logo" i], [class*="navbar" i]')) return true;
+  if (NOT_PRODUCT_IMAGE.test([img.alt, img.title, src.split('/').pop()].join(' '))) return true;
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  return w && h && (w / h > 2.5 || h / w > 2.5); // wąskie paski, np. logo z napisem
+}
+
 /** Zdjęcia produktu/oferty widoczne w formularzu (serwer allegroimg), w oryginalnym rozmiarze. */
 function readFormImageUrls() {
   const urls = [];
   for (const img of document.querySelectorAll('img')) {
     if (img.closest('#allegro-listener-root')) continue;
     const src = img.currentSrc || img.src || '';
-    if (!/allegroimg\.com/.test(src) || (img.naturalWidth && img.naturalWidth < 60)) continue;
+    if (!/allegroimg\.com/.test(src) || (img.naturalWidth && img.naturalWidth < 60) || isInterfaceImage(img, src)) continue;
     const url = src.replace(/\/s\d+\//, '/original/');
     if (!urls.includes(url)) urls.push(url);
   }
@@ -390,28 +402,37 @@ function buildUi() {
     if (state.form.name && !$('productName').value.trim()) $('productName').value = state.form.name;
     const p = state.form.parameters;
     $('catalogInfo').replaceChildren(
-      el('b', {}, `Z formularza: ${p.length} parametrów, ${state.form.imageUrls.length} zdjęć`),
+      el('b', {}, `Z formularza: ${p.length} parametrów, ${formImageUrls().length} zdjęć`),
       p.length ? el('details', {}, el('summary', {}, 'Pokaż parametry'), el('ul', { class: 'msgs' }, ...p.map((x) => el('li', {}, `${x.name}: ${x.value}`)))) : el('div', { class: 'muted' }, 'Wybierz produkt z katalogu w formularzu Allegro i kliknij „Odśwież”.'),
     );
     setMode(currentMode());
     renderPhotos();
   }
 
+  function formImageUrls() {
+    return state.form.imageUrls.filter((u) => !state.removedFormUrls.has(u));
+  }
+
   function photoList() {
     const user = state.userPhotos.map((p, i) => ({ src: p.preview, tag: 'Twoje', remove: () => state.userPhotos.splice(i, 1) }));
-    const form = state.form.imageUrls.map((u) => ({ src: u, tag: 'formularz' }));
+    const form = formImageUrls().map((u) => ({ src: u, tag: 'formularz', remove: () => state.removedFormUrls.add(u) }));
     return [...user, ...form].slice(0, MAX_PHOTOS);
   }
 
   function renderPhotos() {
     const list = photoList();
-    $('photoInfo').textContent = `– ${list.length}/${MAX_PHOTOS}${list.length ? '' : ': kliknij, przeciągnij albo wklej Ctrl+V'}`;
+    $('photoInfo').replaceChildren(
+      `– ${list.length}/${MAX_PHOTOS}${list.length ? '' : ': kliknij, przeciągnij albo wklej Ctrl+V'} `,
+      state.removedFormUrls.size
+        ? el('a', { href: '#', on: { click: (e) => { e.preventDefault(); state.removedFormUrls.clear(); renderPhotos(); } } }, `przywróć usunięte (${state.removedFormUrls.size})`)
+        : '',
+    );
     $('drop').replaceChildren(
       ...list.map((p) => el('div', { class: 'thumb' },
         el('img', { src: p.src, alt: '' }),
         el('span', { class: 'tag' }, p.tag),
-        p.remove ? el('button', { title: 'Usuń', on: { click: (e) => { e.stopPropagation(); p.remove(); renderPhotos(); } } }, '×') : null)),
-      list.length < MAX_PHOTOS ? el('span', { class: 'muted' }, list.length ? '+ dodaj' : 'Kliknij, przeciągnij zdjęcie albo wklej Ctrl+V') : null,
+        el('button', { title: 'Usuń', on: { click: (e) => { e.stopPropagation(); p.remove(); renderPhotos(); } } }, '×'))),
+      ...(list.length < MAX_PHOTOS ? [el('span', { class: 'muted' }, list.length ? '+ dodaj' : 'Kliknij, przeciągnij zdjęcie albo wklej Ctrl+V')] : []),
     );
   }
 
@@ -431,7 +452,7 @@ function buildUi() {
   /** Zdjęcia do wysłania: Twoje + z formularza (pobierane dopiero teraz), max 4. */
   async function collectPhotos() {
     const photos = state.userPhotos.slice(0, MAX_PHOTOS);
-    for (const url of state.form.imageUrls) {
+    for (const url of formImageUrls()) {
       if (photos.length >= MAX_PHOTOS) break;
       try {
         photos.push(await fetchPhoto(url));
@@ -451,7 +472,7 @@ function buildUi() {
       showTab('settings');
       return setStatus('settingsStatus', 'Najpierw wklej klucz API Gemini i kliknij Zapisz.', true);
     }
-    if (!productName && !state.userPhotos.length && !state.form.imageUrls.length) {
+    if (!productName && !state.userPhotos.length && !formImageUrls().length) {
       return setStatus('status', 'Dodaj zdjęcie albo wpisz nazwę produktu.', true);
     }
     $('generate').disabled = true;
