@@ -14,14 +14,30 @@
 
   const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-  function buildGenerateRequest({ apiKey, model, prompt, schema, temperature }) {
-    const generationConfig = { responseMimeType: 'application/json', temperature: temperature ?? 0.7 };
-    if (schema) generationConfig.responseSchema = schema;
+  /**
+   * @param {{apiKey: string, model: string, prompt: string, schema?: object, temperature?: number,
+   *   images?: Array<{mimeType: string, data: string}>, search?: boolean, jsonMode?: boolean}} p
+   *   images – base64 bez prefiksu data:, search – wyszukiwarka Google (grounding),
+   *   jsonMode: false – bez wymuszania JSON/schematu (zapasowo, gdy model nie łączy schematu z wyszukiwarką)
+   */
+  function buildGenerateRequest({ apiKey, model, prompt, schema, temperature, images, search, jsonMode = true }) {
+    const generationConfig = {};
+    if (temperature != null) generationConfig.temperature = temperature;
+    if (jsonMode) {
+      generationConfig.responseMimeType = 'application/json';
+      if (schema) generationConfig.responseSchema = schema;
+    }
+    const parts = [
+      ...(images || []).map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+      { text: prompt },
+    ];
+    const body = { contents: [{ role: 'user', parts }], generationConfig };
+    if (search) body.tools = [{ google_search: {} }];
     return {
       method: 'POST',
       url: `${API_BASE}/models/${encodeURIComponent(String(model).replace(/^models\//, ''))}:generateContent`,
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig }),
+      body: JSON.stringify(body),
     };
   }
 
@@ -35,6 +51,17 @@
     } catch (e) {
       return null;
     }
+  }
+
+  /** JSON z tekstu modelu: cały tekst, blok ```json albo fragment od pierwszej { do ostatniej }. */
+  function extractJson(text) {
+    const direct = safeJson(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+    if (direct) return direct;
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced && safeJson(fenced[1])) return safeJson(fenced[1]);
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    return start >= 0 && end > start ? safeJson(text.slice(start, end + 1)) : null;
   }
 
   /** Czytelny komunikat błędu HTTP z podpowiedzią, co poprawić. */
@@ -64,11 +91,18 @@
     const parts = (cand && cand.content && cand.content.parts) || [];
     const out = parts.filter((p) => !p.thought).map((p) => p.text || '').join('').trim();
     if (!out) throw new Error(`Gemini: pusta odpowiedź${cand && cand.finishReason ? ` (${cand.finishReason})` : ''}`);
-    const json = safeJson(out.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+    const json = extractJson(out);
     if (!json) {
       throw new Error(cand.finishReason === 'MAX_TOKENS' ? 'Gemini: odpowiedź ucięta (MAX_TOKENS)' : 'Gemini: odpowiedź nie jest poprawnym JSON-em');
     }
     return json;
+  }
+
+  /** Czego Gemini szukał w Google (grounding) – do pokazania w panelu. */
+  function parseSearchQueries(text) {
+    const body = safeJson(text) || {};
+    const meta = body.candidates && body.candidates[0] && body.candidates[0].groundingMetadata;
+    return (meta && meta.webSearchQueries) || [];
   }
 
   /** Lista modeli obsługujących generateContent, np. ['gemini-…-flash', …]. */
@@ -81,16 +115,25 @@
       .sort();
   }
 
+  // Model odrzucił połączenie wyszukiwarki z wymuszonym JSON-em → ponów bez schematu.
+  const SCHEMA_WITH_TOOLS_ERROR = /mime|json|schema|tool/i;
+
   /**
-   * Zwraca funkcję ask(prompt, schema) → Promise<object> używaną przez pipeline.
-   * @param {{apiKey: string, model: string, transport: Function, temperature?: number}} cfg
+   * Zwraca funkcję ask(prompt, schema, {images, search}) → Promise<object> używaną przez pipeline.
+   * @param {{apiKey: string, model: string, transport: Function, temperature?: number,
+   *   onSearch?: (queries: string[]) => void}} cfg
    */
   function createAsk(cfg) {
-    return async function ask(prompt, schema) {
+    return async function ask(prompt, schema, opts) {
+      opts = opts || {};
       if (!cfg.apiKey) throw new Error('Brak klucza API Gemini – uzupełnij go w ustawieniach.');
       if (!cfg.model) throw new Error('Brak nazwy modelu Gemini – uzupełnij ją w ustawieniach.');
-      const res = await cfg.transport(buildGenerateRequest({ ...cfg, prompt, schema }));
-      return parseGenerateResponse(res.status, res.text);
+      const request = (jsonMode) => buildGenerateRequest({ ...cfg, prompt, schema, images: opts.images, search: opts.search, jsonMode });
+      let res = await cfg.transport(request(true));
+      if (opts.search && res.status === 400 && SCHEMA_WITH_TOOLS_ERROR.test(res.text)) res = await cfg.transport(request(false));
+      const json = parseGenerateResponse(res.status, res.text);
+      if (cfg.onSearch && opts.search) cfg.onSearch(parseSearchQueries(res.text));
+      return json;
     };
   }
 
@@ -100,5 +143,14 @@
     return parseListModelsResponse(res.status, res.text);
   }
 
-  return { API_BASE, buildGenerateRequest, buildListModelsRequest, parseGenerateResponse, parseListModelsResponse, createAsk, listModels };
+  return {
+    API_BASE,
+    buildGenerateRequest,
+    buildListModelsRequest,
+    parseGenerateResponse,
+    parseSearchQueries,
+    parseListModelsResponse,
+    createAsk,
+    listModels,
+  };
 });

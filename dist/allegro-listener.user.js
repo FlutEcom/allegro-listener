@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Allegro Listener – AI tytuł i opis
 // @namespace    https://github.com/FlutEcom/allegro-listener
-// @version      0.1.0
-// @description  Szybkie wystawianie ofert: Gemini pisze tytuł i opis wg reguł z rules/
+// @version      0.2.0
+// @description  Błyskawiczne wystawianie ofert: zdjęcie + nazwa → Gemini pisze tytuł i opis wg reguł z rules/
 // @match        https://salescenter.allegro.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @connect      generativelanguage.googleapis.com
+// @connect      allegroimg.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -942,14 +943,30 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
 
   const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-  function buildGenerateRequest({ apiKey, model, prompt, schema, temperature }) {
-    const generationConfig = { responseMimeType: 'application/json', temperature: temperature ?? 0.7 };
-    if (schema) generationConfig.responseSchema = schema;
+  /**
+   * @param {{apiKey: string, model: string, prompt: string, schema?: object, temperature?: number,
+   *   images?: Array<{mimeType: string, data: string}>, search?: boolean, jsonMode?: boolean}} p
+   *   images – base64 bez prefiksu data:, search – wyszukiwarka Google (grounding),
+   *   jsonMode: false – bez wymuszania JSON/schematu (zapasowo, gdy model nie łączy schematu z wyszukiwarką)
+   */
+  function buildGenerateRequest({ apiKey, model, prompt, schema, temperature, images, search, jsonMode = true }) {
+    const generationConfig = {};
+    if (temperature != null) generationConfig.temperature = temperature;
+    if (jsonMode) {
+      generationConfig.responseMimeType = 'application/json';
+      if (schema) generationConfig.responseSchema = schema;
+    }
+    const parts = [
+      ...(images || []).map((img) => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
+      { text: prompt },
+    ];
+    const body = { contents: [{ role: 'user', parts }], generationConfig };
+    if (search) body.tools = [{ google_search: {} }];
     return {
       method: 'POST',
       url: `${API_BASE}/models/${encodeURIComponent(String(model).replace(/^models\//, ''))}:generateContent`,
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig }),
+      body: JSON.stringify(body),
     };
   }
 
@@ -963,6 +980,17 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
     } catch (e) {
       return null;
     }
+  }
+
+  /** JSON z tekstu modelu: cały tekst, blok ```json albo fragment od pierwszej { do ostatniej }. */
+  function extractJson(text) {
+    const direct = safeJson(text.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+    if (direct) return direct;
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced && safeJson(fenced[1])) return safeJson(fenced[1]);
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    return start >= 0 && end > start ? safeJson(text.slice(start, end + 1)) : null;
   }
 
   /** Czytelny komunikat błędu HTTP z podpowiedzią, co poprawić. */
@@ -992,11 +1020,18 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
     const parts = (cand && cand.content && cand.content.parts) || [];
     const out = parts.filter((p) => !p.thought).map((p) => p.text || '').join('').trim();
     if (!out) throw new Error(`Gemini: pusta odpowiedź${cand && cand.finishReason ? ` (${cand.finishReason})` : ''}`);
-    const json = safeJson(out.replace(/^```(?:json)?\s*|\s*```$/g, ''));
+    const json = extractJson(out);
     if (!json) {
       throw new Error(cand.finishReason === 'MAX_TOKENS' ? 'Gemini: odpowiedź ucięta (MAX_TOKENS)' : 'Gemini: odpowiedź nie jest poprawnym JSON-em');
     }
     return json;
+  }
+
+  /** Czego Gemini szukał w Google (grounding) – do pokazania w panelu. */
+  function parseSearchQueries(text) {
+    const body = safeJson(text) || {};
+    const meta = body.candidates && body.candidates[0] && body.candidates[0].groundingMetadata;
+    return (meta && meta.webSearchQueries) || [];
   }
 
   /** Lista modeli obsługujących generateContent, np. ['gemini-…-flash', …]. */
@@ -1009,16 +1044,25 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
       .sort();
   }
 
+  // Model odrzucił połączenie wyszukiwarki z wymuszonym JSON-em → ponów bez schematu.
+  const SCHEMA_WITH_TOOLS_ERROR = /mime|json|schema|tool/i;
+
   /**
-   * Zwraca funkcję ask(prompt, schema) → Promise<object> używaną przez pipeline.
-   * @param {{apiKey: string, model: string, transport: Function, temperature?: number}} cfg
+   * Zwraca funkcję ask(prompt, schema, {images, search}) → Promise<object> używaną przez pipeline.
+   * @param {{apiKey: string, model: string, transport: Function, temperature?: number,
+   *   onSearch?: (queries: string[]) => void}} cfg
    */
   function createAsk(cfg) {
-    return async function ask(prompt, schema) {
+    return async function ask(prompt, schema, opts) {
+      opts = opts || {};
       if (!cfg.apiKey) throw new Error('Brak klucza API Gemini – uzupełnij go w ustawieniach.');
       if (!cfg.model) throw new Error('Brak nazwy modelu Gemini – uzupełnij ją w ustawieniach.');
-      const res = await cfg.transport(buildGenerateRequest({ ...cfg, prompt, schema }));
-      return parseGenerateResponse(res.status, res.text);
+      const request = (jsonMode) => buildGenerateRequest({ ...cfg, prompt, schema, images: opts.images, search: opts.search, jsonMode });
+      let res = await cfg.transport(request(true));
+      if (opts.search && res.status === 400 && SCHEMA_WITH_TOOLS_ERROR.test(res.text)) res = await cfg.transport(request(false));
+      const json = parseGenerateResponse(res.status, res.text);
+      if (cfg.onSearch && opts.search) cfg.onSearch(parseSearchQueries(res.text));
+      return json;
     };
   }
 
@@ -1028,77 +1072,241 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
     return parseListModelsResponse(res.status, res.text);
   }
 
-  return { API_BASE, buildGenerateRequest, buildListModelsRequest, parseGenerateResponse, parseListModelsResponse, createAsk, listModels };
+  return {
+    API_BASE,
+    buildGenerateRequest,
+    buildListModelsRequest,
+    parseGenerateResponse,
+    parseSearchQueries,
+    parseListModelsResponse,
+    createAsk,
+    listModels,
+  };
 });
 
 })(NS, undefined);
 
-// ----- src/lib/pipeline.js -----
+// ----- src/lib/listing.js -----
 (function (self, module) {
 /**
- * Generowanie tytułu i opisu: prompt → Gemini → walidacja → (poprawka) → wynik.
- * ask(prompt, schema) → Promise<object> – z gemini.createAsk() albo atrapa w testach.
+ * Szybkie wystawianie: jedno zapytanie do Gemini (zdjęcia + nazwa + wyszukiwarka Google)
+ * rozpoznaje produkt, znajduje słowa kluczowe i styl konkurencji, pisze tytuł i opis.
+ * Potem walidacja wg rules/ i – tylko gdy trzeba – krótkie zapytania naprawcze (bez zdjęć i wyszukiwania).
+ *
+ * Tryby:
+ *   NEW     – nowy produkt spoza katalogu: zdjęcia + nazwa + opcjonalne informacje,
+ *   CATALOG – produkt z katalogu Allegro: nazwa, parametry i zdjęcia z formularza.
  */
 (function (root, factory) {
+  const cjs = typeof module === 'object' && module.exports;
   const api = factory(
-    typeof module === 'object' && module.exports ? require('../rules/title.js') : root.AllegroTitleRules,
-    typeof module === 'object' && module.exports ? require('../rules/description.js') : root.AllegroDescriptionRules,
+    cjs ? require('../rules/title.js') : root.AllegroTitleRules,
+    cjs ? require('../rules/description.js') : root.AllegroDescriptionRules,
   );
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  else root.AllegroPipeline = api;
+  if (cjs) module.exports = api;
+  else root.AllegroListing = api;
 })(typeof self !== 'undefined' ? self : this, function (T, D) {
   'use strict';
 
   const MAX_REPAIRS = 2;
+  const S = { type: 'STRING' };
+  const LIST = { type: 'ARRAY', items: S };
 
-  function titleRuleOptions(input) {
-    return {
-      caseStyle: input.caseStyle,
-      competitorTitles: input.competitorTitles,
-      topKeyword: (input.keywords && input.keywords[0]) || input.productName,
+  const LISTING_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+      product: {
+        type: 'OBJECT',
+        properties: {
+          name: S, brand: S, age: S, features: LIST, benefits: LIST, contents: LIST, smallParts: { type: 'BOOLEAN' },
+        },
+        required: ['name', 'features', 'benefits'],
+      },
+      keywords: LIST,
+      competitorTitles: LIST,
+      caseStyle: { type: 'STRING', enum: ['UPPER', 'TITLE'] },
+      titles: LIST,
+      description: D.DESCRIPTION_SCHEMA,
+    },
+    required: ['product', 'keywords', 'caseStyle', 'titles', 'description'],
+  };
+
+  function list(items) {
+    return (items || []).filter(Boolean).map((x, i) => `${i + 1}. ${x}`).join('\n') || '(brak)';
+  }
+
+  function caseRule(input) {
+    if (input.caseStyle === 'UPPER') return 'CAPSLOCK – cały tytuł wielkimi literami (ustawienie sprzedawcy).';
+    if (input.caseStyle === 'TITLE') return 'Pierwsze Litery Wielkie w każdym słowie (ustawienie sprzedawcy).';
+    return 'taki sam styl jak większość znalezionych tytułów konkurencji: CAPSLOCK (UPPER) albo Pierwsze Litery Wielkie (TITLE). Wybrany styl wpisz w "caseStyle".';
+  }
+
+  /**
+   * Prompt „wszystko w jednym”.
+   * @param {{
+   *   mode: 'NEW'|'CATALOG', productName?: string, extra?: string, parameters?: Array<{name: string, value: string}>,
+   *   imageCount?: number, search?: boolean, caseStyle?: 'AUTO'|'UPPER'|'TITLE',
+   *   socialProof?: string, promo?: string, date?: Date|string
+   * }} input
+   */
+  function buildListingPrompt(input) {
+    const catalog = input.mode === 'CATALOG';
+    const budget = D.hookBudget({ title: 'X'.repeat(T.TITLE_MAX), socialProof: input.socialProof });
+    const params = (input.parameters || []).map((p) => `${p.name}: ${p.value}`);
+    const research = input.search === false
+      ? 'Nie masz dostępu do wyszukiwarki – dobierz frazy, którymi Polacy najczęściej szukają takiego produktu na Allegro, na podstawie swojej wiedzy.'
+      : 'Użyj wyszukiwarki Google: sprawdź Google Trends, podpowiedzi wyszukiwania i oferty na allegro.pl. Znajdź frazy, którymi Polacy najczęściej szukają tego produktu.';
+    return `Jesteś ekspertem od sprzedaży zabawek na Allegro: SEO i copywriting. Przygotuj kompletną ofertę.
+
+TRYB: ${catalog
+    ? 'PRODUKT Z KATALOGU ALLEGRO – nazwa i parametry poniżej pochodzą z katalogu i są prawdziwe. Opieraj się na nich.'
+    : 'NOWY PRODUKT spoza katalogu – rozpoznaj go ze zdjęć i nazwy.'}
+
+KROK 1 – PRODUKT ("product"):
+Na podstawie ${input.imageCount ? `${input.imageCount} zdjęć, ` : ''}nazwy i danych ustal: nazwę, markę, wiek, cechy, korzyści, zawartość zestawu i czy ma małe elementy (smallParts – np. koraliki, drobne klocki).
+Tylko fakty widoczne na zdjęciach albo podane poniżej. Nie zgaduj wymiarów, liczby elementów, materiałów ani certyfikatów, jeśli ich nie widać i nie podano.
+
+KROK 2 – SŁOWA KLUCZOWE ("keywords", "competitorTitles", "caseStyle"):
+${research}
+Zwróć 5–8 fraz od najpopularniejszej. Pierwsza fraza to TOP KEYWORD – krótka nazwa produktu, jaką wpisują klienci.
+Zwróć do 10 tytułów ofert konkurencji z Allegro, jeśli je znalazłeś.
+
+KROK 3 – TYTUŁ ("titles"): 5 różnych propozycji. Każda zaczyna się od pierwszej frazy z "keywords".
+${T.RULES_TEXT.replace('{{CASE_RULE}}', caseRule(input))}
+Policz znaki każdego tytułu przed odpowiedzią.
+
+KROK 4 – OPIS ("description"):
+${D.RULES_TEXT}
+LIMIT HOOKA: headline + benefit + cta razem max ${budget} znaków.
+Okazje prezentowe: ${D.occasionsFor(input.date).occasions.join(', ')}
+
+DANE OD SPRZEDAWCY:
+Nazwa: ${input.productName || '(brak – rozpoznaj ze zdjęć)'}
+${params.length ? `Parametry${catalog ? ' z katalogu' : ''}:\n${list(params)}\n` : ''}${input.socialProof ? `Social proof (wtyczka wstawi go sama): ${input.socialProof}\n` : ''}${input.extra ? `Dodatkowe informacje:\n${input.extra}\n` : ''}
+Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
+{"product":{"name":"","brand":"","age":"","features":[""],"benefits":[""],"contents":[""],"smallParts":false},"keywords":[""],"competitorTitles":[""],"caseStyle":"UPPER","titles":[""],"description":{"hook":{"headline":"","benefit":"","cta":""},"topBenefits":[""],"gains":[{"feature":"","benefit":"","emotion":""}],"play":{"heading":"","paragraphs":[""]},"glossary":[{"term":"","explanation":""}],"contents":{"heading":"","items":[""],"sizeNote":""},"gift":{"heading":"","paragraph":""},"spec":[{"name":"","value":""}],"faq":[{"q":"","a":""}],"closing":""}}`;
+  }
+
+  function strings(arr) {
+    return (Array.isArray(arr) ? arr : []).map((x) => (typeof x === 'string' ? x : x && (x.phrase || x.title || x.name))).filter(Boolean).map((s) => String(s).trim()).filter(Boolean);
+  }
+
+  /** Styl liter: ustawienie sprzedawcy > tytuły konkurencji (≥ 3) > wybór Gemini > CAPSLOCK. */
+  function resolveCaseStyle(input, research) {
+    if (input.caseStyle === 'UPPER' || input.caseStyle === 'TITLE') return input.caseStyle;
+    if (research.competitorTitles.length >= 3) return T.detectCaseStyle(research.competitorTitles);
+    return research.caseStyle === 'TITLE' ? 'TITLE' : 'UPPER';
+  }
+
+  /** Dane do reguł tytułu/opisu z odpowiedzi Gemini + danych sprzedawcy. */
+  function buildRuleInputs(input, first) {
+    const product = (first && first.product) || {};
+    const research = {
+      keywords: strings(first && first.keywords),
+      competitorTitles: strings(first && first.competitorTitles).slice(0, 10),
+      caseStyle: first && first.caseStyle,
+    };
+    const productName = input.productName || product.name || '';
+    if (!research.keywords.length && productName) research.keywords = [productName];
+    research.caseStyle = resolveCaseStyle(input, research);
+    const titleInput = {
+      productName,
+      keywords: research.keywords,
+      caseStyle: research.caseStyle,
+      competitorTitles: research.competitorTitles,
       allowWords: input.allowWords,
+      brand: product.brand,
+      age: product.age,
+      features: strings(product.features),
+      benefits: strings(product.benefits),
+      extra: input.extra,
+    };
+    const descInput = {
+      productName,
+      keywords: research.keywords,
+      age: product.age,
+      brand: product.brand,
+      features: titleInput.features,
+      benefits: titleInput.benefits,
+      contents: strings(product.contents),
+      parameters: input.parameters || [],
+      socialProof: input.socialProof,
+      promo: input.promo,
+      smallParts: input.smallParts != null ? input.smallParts : !!product.smallParts,
+      condition: input.condition || 'NEW',
+      date: input.date,
+      extra: input.extra,
+    };
+    return { product, research, titleInput, descInput };
+  }
+
+  function titleRuleOptions(titleInput) {
+    return {
+      caseStyle: titleInput.caseStyle,
+      topKeyword: titleInput.keywords[0] || titleInput.productName,
+      allowWords: titleInput.allowWords,
     };
   }
 
-  /**
-   * @returns {Promise<{best: string|null, results: Array<object>, attempts: number}>}
-   *   results – wszystkie propozycje ze wszystkich prób (z polem attempt, errors, warnings)
-   */
-  async function generateTitle(input, ask, opts) {
-    const maxRepairs = (opts && opts.maxRepairs) ?? MAX_REPAIRS;
-    const ruleOpts = titleRuleOptions(input);
-    let prompt = T.buildTitlePrompt(input);
-    const all = [];
-    for (let attempt = 1; attempt <= maxRepairs + 1; attempt++) {
-      const res = await ask(prompt, T.TITLE_SCHEMA);
-      const { best, results } = T.pickBestTitle(res && res.candidates, ruleOpts);
-      all.push(...results.map((r) => ({ ...r, attempt })));
-      if (best) return { best, results: all, attempts: attempt };
-      const failed = results.length ? results : [{ title: '', length: 0, errors: ['brak propozycji w odpowiedzi'] }];
-      prompt = T.buildTitleRepairPrompt(input, failed);
-    }
-    return { best: null, results: all, attempts: maxRepairs + 1 };
+  /** Najmniej zły tytuł, gdy żaden nie przeszedł walidacji (żeby opis i tak powstał). */
+  function leastBad(results) {
+    return [...results].sort((a, b) => a.errors.length - b.errors.length || Math.abs(72 - a.length) - Math.abs(72 - b.length))[0];
   }
 
   /**
-   * @returns {Promise<{ok: boolean, errors: string[], warnings: string[], description: object, plainText: string, content: object, attempts: number}>}
-   *   Gdy po poprawkach nadal są błędy – zwraca ostatnią wersję z ok: false.
+   * @param {object} input  patrz buildListingPrompt + images: [{mimeType, data}]
+   * @param {Function} ask  ask(prompt, schema, {images, search}) z gemini.createAsk
+   * @param {{maxRepairs?: number, onProgress?: (msg: string) => void}} [opts]
    */
-  async function generateDescription(input, ask, opts) {
-    if (!input.title) throw new Error('Najpierw wybierz tytuł – opis zaczyna się od tytułu (H1).');
-    const maxRepairs = (opts && opts.maxRepairs) ?? MAX_REPAIRS;
-    let prompt = D.buildDescriptionPrompt(input);
-    let last = null;
-    for (let attempt = 1; attempt <= maxRepairs + 1; attempt++) {
-      const content = await ask(prompt, D.DESCRIPTION_SCHEMA);
-      last = { ...D.validateDescription(content, input), content, attempts: attempt };
-      if (last.ok) return last;
-      prompt = D.buildDescriptionRepairPrompt(input, content, last.errors);
+  async function generateListing(input, ask, opts) {
+    opts = opts || {};
+    const maxRepairs = opts.maxRepairs ?? MAX_REPAIRS;
+    const progress = opts.onProgress || (() => {});
+    const images = input.images || [];
+
+    progress(input.search === false ? 'Gemini analizuje produkt i pisze ofertę…' : 'Gemini analizuje produkt, szuka słów kluczowych i pisze ofertę…');
+    const first = await ask(buildListingPrompt({ ...input, imageCount: images.length }), LISTING_SCHEMA, { images, search: input.search !== false });
+    const { product, research, titleInput, descInput } = buildRuleInputs(input, first);
+
+    // Tytuł
+    const ruleOpts = titleRuleOptions(titleInput);
+    let picked = T.pickBestTitle(strings(first && first.titles), ruleOpts);
+    const titleResults = picked.results.map((r) => ({ ...r, attempt: 1 }));
+    let titleAttempts = 1;
+    while (!picked.best && titleAttempts <= maxRepairs) {
+      titleAttempts++;
+      progress(`Poprawiam tytuł (próba ${titleAttempts})…`);
+      const failed = picked.results.length ? picked.results : [{ title: '', length: 0, errors: ['brak propozycji w odpowiedzi'] }];
+      const res = await ask(T.buildTitleRepairPrompt(titleInput, failed), T.TITLE_SCHEMA);
+      picked = T.pickBestTitle(res && res.candidates, ruleOpts);
+      titleResults.push(...picked.results.map((r) => ({ ...r, attempt: titleAttempts })));
     }
-    return last;
+    const fallback = !picked.best && titleResults.length ? leastBad(titleResults).title : '';
+    const title = picked.best || fallback;
+
+    // Opis
+    descInput.title = title;
+    let content = (first && first.description) || {};
+    let desc = D.validateDescription(content, descInput);
+    let descAttempts = 1;
+    while (!desc.ok && title && descAttempts <= maxRepairs) {
+      descAttempts++;
+      progress(`Poprawiam opis (próba ${descAttempts})…`);
+      content = await ask(D.buildDescriptionRepairPrompt(descInput, content, desc.errors), D.DESCRIPTION_SCHEMA);
+      desc = D.validateDescription(content, descInput);
+    }
+
+    return {
+      product,
+      research,
+      title: { value: title, ok: !!picked.best, results: titleResults, attempts: titleAttempts },
+      description: { ...desc, content, attempts: descAttempts },
+      descInput,
+      titleInput,
+    };
   }
 
-  return { MAX_REPAIRS, generateTitle, generateDescription };
+  return { MAX_REPAIRS, LISTING_SCHEMA, buildListingPrompt, buildRuleInputs, generateListing };
 });
 
 })(NS, undefined);
@@ -1107,9 +1315,10 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
 (function (self, module) {
 /**
  * Panel wtyczki na salescenter.allegro.com/offer…
- * Dane produktu → Gemini → tytuł i opis wg reguł z rules/ → wstawienie / kopiowanie.
+ * Zdjęcie + nazwa (albo dane z katalogu) → jedno kliknięcie → Gemini: słowa kluczowe, tytuł, opis
+ * wg reguł z rules/ → wstawienie tytułu do formularza, kopiowanie sekcji opisu.
  *
- * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroPipeline)
+ * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroListing)
  * dostarcza scripts/build.js w obiekcie `self`.
  */
 /* global GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_setClipboard */
@@ -1118,43 +1327,95 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
 const T = self.AllegroTitleRules;
 const D = self.AllegroDescriptionRules;
 const G = self.AllegroGemini;
-const P = self.AllegroPipeline;
+const L = self.AllegroListing;
 
 const OFFER_PATH = /^\/offer/;
 const DEFAULT_MODEL = 'gemini-3.8-flash';
+const MAX_PHOTOS = 4;
+const PHOTO_MAX_SIDE = 1024;
 
-// ---------- ustawienia i szkic ----------
+// ---------- ustawienia ----------
 
 const settings = {
   get apiKey() { return GM_getValue('apiKey', ''); },
   get model() { return GM_getValue('model', '') || DEFAULT_MODEL; },
-  save(apiKey, model) {
-    GM_setValue('apiKey', apiKey.trim());
-    GM_setValue('model', model.trim().replace(/^models\//, ''));
+  get caseStyle() { return GM_getValue('caseStyle', 'AUTO'); },
+  get search() { return GM_getValue('search', true); },
+  save(values) {
+    GM_setValue('apiKey', values.apiKey.trim());
+    GM_setValue('model', values.model.trim().replace(/^models\//, ''));
+    GM_setValue('caseStyle', values.caseStyle);
+    GM_setValue('search', values.search);
   },
 };
 
-const state = { title: GM_getValue('title', ''), titleResults: [], description: null };
+const state = {
+  mode: null, // 'NEW' | 'CATALOG' – null = wybór automatyczny
+  userPhotos: [], // [{mimeType, data, preview}]
+  form: { name: '', parameters: [], imageUrls: [] },
+  result: null,
+  searchQueries: [],
+};
 
 // ---------- transport ----------
 
-function gmTransport(req) {
+function gm(req) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      method: req.method,
-      url: req.url,
-      headers: req.headers,
-      data: req.body,
       timeout: 180000,
-      onload: (r) => resolve({ status: r.status, text: r.responseText }),
-      onerror: () => reject(new Error('Brak połączenia z Gemini API')),
-      ontimeout: () => reject(new Error('Gemini nie odpowiada (timeout)')),
+      ...req,
+      onload: resolve,
+      onerror: () => reject(new Error(`Brak połączenia: ${new URL(req.url).host}`)),
+      ontimeout: () => reject(new Error(`Przekroczony czas odpowiedzi: ${new URL(req.url).host}`)),
     });
   });
 }
 
+async function gmTransport(req) {
+  const r = await gm({ method: req.method, url: req.url, headers: req.headers, data: req.body });
+  return { status: r.status, text: r.responseText };
+}
+
 function ask() {
-  return G.createAsk({ apiKey: settings.apiKey, model: settings.model, transport: gmTransport });
+  return G.createAsk({
+    apiKey: settings.apiKey,
+    model: settings.model,
+    transport: gmTransport,
+    onSearch: (q) => { state.searchQueries = q; },
+  });
+}
+
+// ---------- zdjęcia ----------
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result);
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(blob);
+  });
+}
+
+/** Zmniejsza zdjęcie do max 1024 px (JPEG) – szybciej i taniej dla Gemini. */
+async function preparePhoto(blob) {
+  const bmp = await createImageBitmap(blob);
+  const scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(bmp.width, bmp.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  const jpeg = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+  const preview = await blobToDataUrl(jpeg);
+  return { mimeType: 'image/jpeg', data: preview.split(',')[1], preview };
+}
+
+async function fetchPhoto(url) {
+  const r = await gm({ method: 'GET', url, responseType: 'blob', timeout: 30000 });
+  if (r.status !== 200) throw new Error(`Zdjęcie ${url}: HTTP ${r.status}`);
+  return preparePhoto(r.response);
 }
 
 // ---------- integracja ze stroną ----------
@@ -1166,9 +1427,13 @@ function labelText(el) {
   return [byFor, wrap, labelled && document.getElementById(labelled)].filter(Boolean).map((l) => l.textContent).join(' ');
 }
 
+function visibleFields(selector) {
+  return [...document.querySelectorAll(selector)].filter((el) => el.offsetParent !== null && !el.closest('#allegro-listener-root'));
+}
+
 /** Pole tytułu oferty w formularzu (heurystyka: maxlength 75 albo etykieta „Tytuł”). */
 function findTitleInput() {
-  const fields = [...document.querySelectorAll('input[type="text"], input:not([type]), textarea')].filter((el) => el.offsetParent !== null);
+  const fields = visibleFields('input[type="text"], input:not([type]), textarea');
   return (
     fields.find((el) => el.maxLength === T.TITLE_MAX) ||
     fields.find((el) => /tytu[łl] oferty|tytu[łl]|nazwa oferty/i.test([el.name, el.id, el.placeholder, el.getAttribute('aria-label'), labelText(el)].join(' ')))
@@ -1190,9 +1455,7 @@ function fieldLabel(el) {
 function readFormParameters() {
   const out = [];
   const seen = new Set();
-  const fields = document.querySelectorAll('input[type="text"], input[type="number"], input:not([type]), select, [role="combobox"]');
-  for (const el of fields) {
-    if (el.offsetParent === null || el.closest('#allegro-listener-root')) continue;
+  for (const el of visibleFields('input[type="text"], input[type="number"], input:not([type]), select, [role="combobox"]')) {
     const name = fieldLabel(el).replace(/\s+/g, ' ').replace(/[*:]\s*$/, '').trim();
     let value = el.tagName === 'SELECT' ? (el.selectedOptions[0] || {}).textContent : el.value ?? el.textContent;
     value = String(value || '').replace(/\s+/g, ' ').trim();
@@ -1201,6 +1464,24 @@ function readFormParameters() {
     out.push({ name, value });
   }
   return out;
+}
+
+/** Zdjęcia produktu/oferty widoczne w formularzu (serwer allegroimg), w oryginalnym rozmiarze. */
+function readFormImageUrls() {
+  const urls = [];
+  for (const img of document.querySelectorAll('img')) {
+    if (img.closest('#allegro-listener-root')) continue;
+    const src = img.currentSrc || img.src || '';
+    if (!/allegroimg\.com/.test(src) || (img.naturalWidth && img.naturalWidth < 60)) continue;
+    const url = src.replace(/\/s\d+\//, '/original/');
+    if (!urls.includes(url)) urls.push(url);
+  }
+  return urls;
+}
+
+function readForm() {
+  const title = findTitleInput();
+  return { name: (title && title.value.trim()) || '', parameters: readFormParameters(), imageUrls: readFormImageUrls() };
 }
 
 /** Ustawia wartość tak, żeby zauważył ją React (natywny setter + zdarzenia). */
@@ -1212,8 +1493,7 @@ function setNativeValue(el, value) {
 }
 
 function copy(text, html) {
-  if (html) GM_setClipboard(text, 'html');
-  else GM_setClipboard(text, 'text');
+  GM_setClipboard(text, html ? 'html' : 'text');
 }
 
 // ---------- DOM ----------
@@ -1237,7 +1517,7 @@ const CSS_TEXT = `
   border-radius: 24px; padding: 12px 18px; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
 .panel { position: fixed; top: 0; right: 0; width: 460px; max-width: 100vw; height: 100vh; z-index: 2147483001; background: #fff;
   color: #222; box-shadow: -4px 0 20px rgba(0,0,0,.2); display: flex; flex-direction: column; font-size: 13px; }
-.panel[hidden], .fab[hidden] { display: none; }
+.panel[hidden], .fab[hidden], [hidden] { display: none !important; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #ff5a00; color: #fff; }
 header b { font-size: 15px; }
 header button { background: transparent; border: 0; color: #fff; font-size: 20px; cursor: pointer; }
@@ -1245,12 +1525,24 @@ nav { display: flex; border-bottom: 1px solid #ddd; }
 nav button { flex: 1; padding: 9px 4px; border: 0; background: #f6f6f6; cursor: pointer; font-size: 13px; }
 nav button.active { background: #fff; border-bottom: 2px solid #ff5a00; font-weight: 600; }
 main { flex: 1; overflow: auto; padding: 12px 14px 40px; }
+.modes { display: flex; gap: 6px; }
+.modes button { flex: 1; padding: 10px 6px; border: 2px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; text-align: left; }
+.modes button b { display: block; font-size: 14px; }
+.modes button.active { border-color: #ff5a00; background: #fff4ec; }
 label { display: block; margin: 10px 0 3px; font-weight: 600; }
-small { color: #777; font-weight: 400; }
+small, .muted { color: #777; font-weight: 400; }
 input[type=text], input[type=password], textarea, select { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
 textarea { min-height: 54px; resize: vertical; }
-.check { display: flex; gap: 6px; align-items: center; font-weight: 400; }
+.check { display: flex; gap: 6px; align-items: center; font-weight: 400; margin: 4px 12px 0 0; }
+.row { display: flex; flex-wrap: wrap; align-items: center; }
+.drop { border: 2px dashed #ccc; border-radius: 6px; padding: 8px; min-height: 76px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; cursor: pointer; outline: none; }
+.drop:focus, .drop.over { border-color: #ff5a00; background: #fff8f3; }
+.thumb { position: relative; width: 60px; height: 60px; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; background: #fafafa; }
+.thumb img { width: 100%; height: 100%; object-fit: contain; }
+.thumb button { position: absolute; top: 0; right: 0; border: 0; background: rgba(0,0,0,.6); color: #fff; cursor: pointer; font-size: 11px; padding: 1px 4px; }
+.thumb .tag { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,.5); color: #fff; font-size: 9px; text-align: center; }
 .btn { background: #ff5a00; color: #fff; border: 0; border-radius: 4px; padding: 8px 12px; font-weight: 600; cursor: pointer; margin: 8px 6px 0 0; }
+.btn.big { width: 100%; padding: 12px; font-size: 15px; margin-top: 14px; }
 .btn.sec { background: #eee; color: #222; }
 .btn.small { padding: 4px 8px; font-size: 12px; margin-top: 4px; }
 .btn:disabled { opacity: .5; cursor: wait; }
@@ -1258,42 +1550,16 @@ textarea { min-height: 54px; resize: vertical; }
 .status.err { color: #c00; }
 .card { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
 .card.ok { border-color: #2a9d4b; }
-.card.best { box-shadow: 0 0 0 2px #2a9d4b inset; }
-.len { font-weight: 600; }
+h3 { font-size: 14px; margin: 18px 0 4px; border-top: 1px solid #eee; padding-top: 12px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { background: #f0f0f0; border-radius: 12px; padding: 2px 8px; }
+.chip.top { background: #ff5a00; color: #fff; }
 ul.msgs { margin: 4px 0 0; padding-left: 18px; }
 .e { color: #c00; } .w { color: #b36b00; }
 .hint { background: #fff4ec; border-left: 3px solid #ff5a00; padding: 4px 8px; margin-bottom: 6px; color: #7a3c00; }
 .preview h1 { font-size: 17px; margin: 4px 0; } .preview h2 { font-size: 15px; margin: 4px 0; } .preview p { margin: 3px 0; }
+details { margin-top: 8px; } summary { cursor: pointer; color: #555; }
 `;
-
-function textarea(id, rows) {
-  return el('textarea', { id, rows: String(rows || 3) });
-}
-
-const FIELDS = [
-  ['productName', 'Nazwa produktu', () => el('input', { type: 'text', id: 'productName' })],
-  ['keywords', 'Frazy kluczowe', () => textarea('keywords', 3), 'jedna w linii, od najpopularniejszej (Google Trends)'],
-  ['age', 'Wiek', () => el('input', { type: 'text', id: 'age', placeholder: 'np. 3+' })],
-  ['brand', 'Marka', () => el('input', { type: 'text', id: 'brand' })],
-  ['features', 'Cechy', () => textarea('features'), 'jedna w linii'],
-  ['benefits', 'Korzyści', () => textarea('benefits'), 'jedna w linii'],
-  ['contents', 'Zawartość zestawu', () => textarea('contents'), 'jeden element w linii'],
-  ['parameters', 'Parametry', () => textarea('parameters'), 'Nazwa: wartość – jeden w linii'],
-  ['competitorTitles', 'Tytuły TOP 10 konkurencji', () => textarea('competitorTitles', 4), 'wklej, jeden w linii – do wyboru stylu liter'],
-  ['caseStyle', 'Wielkość liter w tytule', () =>
-    el('select', { id: 'caseStyle' },
-      el('option', { value: 'AUTO' }, 'AUTO – jak konkurencja'),
-      el('option', { value: 'UPPER' }, 'CAPSLOCK'),
-      el('option', { value: 'TITLE' }, 'Pierwsze Litery Wielkie'))],
-  ['allowWords', 'Dozwolone mimo zakazu', () => el('input', { type: 'text', id: 'allowWords' }), 'po przecinku, np. słowo z nazwy produktu'],
-  ['socialProof', 'Social proof', () => el('input', { type: 'text', id: 'socialProof', placeholder: 'np. 4,9/5 – 1200 ocen' }), 'tylko prawdziwe dane'],
-  ['promo', 'Promocja', () => el('input', { type: 'text', id: 'promo' }), 'tylko prawdziwa – trafi do opisu dosłownie'],
-  ['extra', 'Dodatkowe informacje', () => textarea('extra')],
-];
-
-function lines(v) {
-  return String(v || '').split('\n').map((s) => s.trim()).filter(Boolean);
-}
 
 function buildUi() {
   const host = el('div', { id: 'allegro-listener-root' });
@@ -1301,37 +1567,60 @@ function buildUi() {
   root.append(el('style', {}, CSS_TEXT));
   document.body.append(host);
   const $ = (id) => root.getElementById(id);
+  const fileInput = el('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, on: { change: () => addFiles(fileInput.files) } });
 
-  // --- Dane ---
-  const dataTab = el('div', { id: 'tab-data' },
-    ...FIELDS.map(([id, label, make, hint]) => [el('label', { for: id }, label, hint ? el('small', {}, ` – ${hint}`) : null), make()]),
-    el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'smallParts' }), 'Zawiera małe elementy (ostrzeżenie 36 mies.)'),
-    el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'isNew', checked: true }), 'Produkt nowy'),
-    el('button', { class: 'btn sec', on: { click: pullFromPage } }, 'Pobierz z formularza'),
-    el('button', { class: 'btn sec', on: { click: clearDraft } }, 'Wyczyść'),
-    el('div', { class: 'status', id: 'dataStatus' }),
-  );
-
-  // --- Tytuł ---
-  const titleTab = el('div', { id: 'tab-title', hidden: true },
-    el('button', { class: 'btn', id: 'genTitle', on: { click: onGenerateTitle } }, 'Generuj tytuł'),
-    el('div', { class: 'status', id: 'titleStatus' }),
-    el('label', { for: 'chosenTitle' }, 'Wybrany tytuł ', el('small', { id: 'chosenInfo' })),
-    el('input', { type: 'text', id: 'chosenTitle', on: { input: onChosenTitleInput } }),
-    el('ul', { class: 'msgs', id: 'chosenMsgs' }),
-    el('button', { class: 'btn', on: { click: insertTitle } }, 'Wstaw do formularza'),
-    el('button', { class: 'btn sec', on: { click: () => copy($('chosenTitle').value) } }, 'Kopiuj'),
-    el('div', { id: 'titleResults' }),
-  );
-
-  // --- Opis ---
-  const descTab = el('div', { id: 'tab-desc', hidden: true },
-    el('button', { class: 'btn', id: 'genDesc', on: { click: onGenerateDescription } }, 'Generuj opis'),
-    el('button', { class: 'btn sec', on: { click: () => state.description && copy(D.toPlainText(state.description.description)) } }, 'Kopiuj cały tekst'),
-    el('button', { class: 'btn sec', on: { click: copyApiJson } }, 'Kopiuj JSON (API)'),
-    el('div', { class: 'status', id: 'descStatus' }),
-    el('ul', { class: 'msgs', id: 'descMsgs' }),
-    el('div', { id: 'descSections' }),
+  // --- Generuj ---
+  const genTab = el('div', { id: 'tab-gen' },
+    el('div', { class: 'modes' },
+      el('button', { id: 'modeNEW', on: { click: () => setMode('NEW', true) } }, el('b', {}, 'Nowy produkt'), el('span', { class: 'muted' }, 'zdjęcie + nazwa')),
+      el('button', { id: 'modeCATALOG', on: { click: () => setMode('CATALOG', true) } }, el('b', {}, 'Z katalogu'), el('span', { class: 'muted' }, 'dane z formularza Allegro')),
+    ),
+    el('label', { for: 'productName' }, 'Nazwa produktu'),
+    el('input', { type: 'text', id: 'productName', placeholder: 'np. Klocki magnetyczne 100 el.' }),
+    el('label', {}, 'Zdjęcia ', el('small', { id: 'photoInfo' })),
+    el('div', { class: 'drop', id: 'drop', tabindex: '0', title: 'Kliknij, przeciągnij zdjęcie albo wklej Ctrl+V',
+      on: {
+        click: (e) => { if (e.target.id === 'drop' || e.target.classList.contains('muted')) fileInput.click(); },
+        dragover: (e) => { e.preventDefault(); $('drop').classList.add('over'); },
+        dragleave: () => $('drop').classList.remove('over'),
+        drop: (e) => { e.preventDefault(); $('drop').classList.remove('over'); addFiles(e.dataTransfer.files); },
+      } }),
+    fileInput,
+    el('div', { id: 'catalogInfo', class: 'card', hidden: true }),
+    el('button', { class: 'btn sec small', on: { click: refreshForm } }, 'Odśwież dane z formularza'),
+    el('label', { for: 'extra' }, 'Dodatkowe informacje ', el('small', {}, '– opcjonalnie: wymiary, wiek, zawartość, materiał…')),
+    el('textarea', { id: 'extra', rows: '3' }),
+    el('details', {},
+      el('summary', {}, 'Więcej opcji'),
+      el('label', { for: 'promo' }, 'Promocja ', el('small', {}, '– tylko prawdziwa, trafi do opisu dosłownie')),
+      el('input', { type: 'text', id: 'promo' }),
+      el('label', { for: 'socialProof' }, 'Social proof ', el('small', {}, '– tylko prawdziwe dane, np. 4,9/5 – 1200 ocen')),
+      el('input', { type: 'text', id: 'socialProof' }),
+      el('label', { for: 'allowWords' }, 'Dozwolone mimo zakazu ', el('small', {}, '– po przecinku, np. słowo z nazwy produktu')),
+      el('input', { type: 'text', id: 'allowWords' }),
+    ),
+    el('button', { class: 'btn big', id: 'generate', on: { click: onGenerate } }, '⚡ Generuj tytuł i opis'),
+    el('div', { class: 'status', id: 'status' }),
+    el('div', { id: 'results', hidden: true },
+      el('h3', {}, 'Słowa kluczowe'),
+      el('div', { class: 'chips', id: 'keywords' }),
+      el('div', { class: 'muted', id: 'searched' }),
+      el('h3', {}, 'Tytuł ', el('small', { id: 'titleInfo' })),
+      el('input', { type: 'text', id: 'title', on: { input: refreshDescription } }),
+      el('ul', { class: 'msgs', id: 'titleMsgs' }),
+      el('button', { class: 'btn', on: { click: insertTitle } }, 'Wstaw do formularza'),
+      el('button', { class: 'btn sec', on: { click: () => copy($('title').value) } }, 'Kopiuj'),
+      el('details', {}, el('summary', { id: 'altTitlesSummary' }, 'Inne propozycje'), el('div', { id: 'altTitles' })),
+      el('h3', {}, 'Opis'),
+      el('div', { class: 'row' },
+        el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'smallParts', on: { change: refreshDescription } }), 'Małe elementy (ostrzeżenie 36 mies.)'),
+        el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'isNew', checked: true, on: { change: refreshDescription } }), 'Produkt nowy'),
+      ),
+      el('ul', { class: 'msgs', id: 'descMsgs' }),
+      el('button', { class: 'btn', on: { click: () => copyAll(true) } }, 'Kopiuj cały opis'),
+      el('button', { class: 'btn sec', on: { click: () => copyAll(false) } }, 'Kopiuj sam tekst'),
+      el('div', { id: 'descSections' }),
+    ),
   );
 
   // --- Ustawienia ---
@@ -1341,22 +1630,39 @@ function buildUi() {
     el('label', { for: 'model' }, 'Model Gemini ', el('small', {}, `– domyślnie ${DEFAULT_MODEL}`)),
     el('input', { type: 'text', id: 'model', value: settings.model, list: 'modelList' }),
     el('datalist', { id: 'modelList' }),
+    el('label', { for: 'caseStyle' }, 'Wielkość liter w tytule'),
+    el('select', { id: 'caseStyle' },
+      el('option', { value: 'AUTO' }, 'AUTO – jak konkurencja (Gemini sprawdza)'),
+      el('option', { value: 'UPPER' }, 'Zawsze CAPSLOCK'),
+      el('option', { value: 'TITLE' }, 'Zawsze Pierwsze Litery Wielkie')),
+    el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'search', checked: settings.search }),
+      'Szukaj słów kluczowych w Google (Trends, Allegro) – dokładniej, ale wolniej'),
     el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz'),
     el('button', { class: 'btn sec', on: { click: loadModels } }, 'Pobierz listę modeli'),
     el('div', { class: 'status', id: 'settingsStatus' }),
   );
+  settingsTab.querySelector('#caseStyle').value = settings.caseStyle;
 
-  const tabs = { data: ['Dane', dataTab], title: ['Tytuł', titleTab], desc: ['Opis', descTab], settings: ['Ustawienia', settingsTab] };
+  const tabs = { gen: ['Generuj', genTab], settings: ['Ustawienia', settingsTab] };
   const nav = el('nav', {}, ...Object.entries(tabs).map(([key, [label]]) =>
-    el('button', { 'data-tab': key, class: key === 'data' ? 'active' : '', on: { click: () => showTab(key) } }, label)));
+    el('button', { 'data-tab': key, class: key === 'gen' ? 'active' : '', on: { click: () => showTab(key) } }, label)));
 
   const panel = el('div', { class: 'panel', hidden: true },
     el('header', {}, el('b', {}, '✨ Allegro Listener'), el('button', { title: 'Zamknij', on: { click: () => toggle(false) } }, '×')),
     nav,
-    el('main', { on: { input: saveDraft, change: saveDraft } }, dataTab, titleTab, descTab, settingsTab),
+    el('main', {}, genTab, settingsTab),
   );
   const fab = el('button', { class: 'fab', on: { click: () => toggle(true) } }, '✨ AI oferta');
   root.append(fab, panel);
+
+  // Ctrl+V ze zdjęciem w panelu
+  root.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData ? e.clipboardData.files : [])].filter((f) => f.type.startsWith('image/'));
+    if (files.length) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  });
 
   function showTab(key) {
     for (const [k, [, node]] of Object.entries(tabs)) node.hidden = k !== key;
@@ -1366,7 +1672,9 @@ function buildUi() {
   function toggle(open) {
     panel.hidden = !open;
     fab.hidden = open;
-    if (open && !settings.apiKey) showTab('settings');
+    if (!open) return;
+    refreshForm();
+    if (!settings.apiKey) showTab('settings');
   }
 
   function setStatus(id, text, isError) {
@@ -1381,187 +1689,191 @@ function buildUi() {
     );
   }
 
-  // --- szkic danych ---
-  function saveDraft(ev) {
-    if (!ev.target.closest('#tab-data')) return;
-    const draft = {};
-    for (const [id] of FIELDS) draft[id] = $(id).value;
-    draft.smallParts = $('smallParts').checked;
-    draft.isNew = $('isNew').checked;
-    GM_setValue('draft', draft);
+  // --- tryb i dane z formularza ---
+  function setMode(mode, manual) {
+    if (manual) state.mode = mode;
+    for (const m of ['NEW', 'CATALOG']) $(`mode${m}`).classList.toggle('active', m === mode);
+    $('catalogInfo').hidden = mode !== 'CATALOG';
   }
 
-  function loadDraft() {
-    const draft = GM_getValue('draft', null);
-    if (!draft) return;
-    for (const [id] of FIELDS) if (draft[id] != null) $(id).value = draft[id];
-    $('smallParts').checked = !!draft.smallParts;
-    $('isNew').checked = draft.isNew !== false;
+  function currentMode() {
+    return state.mode || (state.form.parameters.length >= 3 ? 'CATALOG' : 'NEW');
   }
 
-  function clearDraft() {
-    for (const [id] of FIELDS) $(id).value = id === 'caseStyle' ? 'AUTO' : '';
-    $('smallParts').checked = false;
-    $('isNew').checked = true;
-    GM_setValue('draft', null);
-    setChosenTitle('');
-  }
-
-  function pullFromPage() {
-    const input = findTitleInput();
-    const found = [];
-    if (input && input.value && !$('productName').value.trim()) {
-      $('productName').value = input.value;
-      found.push('nazwa');
-    }
-    const existing = lines($('parameters').value);
-    const names = new Set(existing.map((l) => l.split(':')[0].trim().toLowerCase()));
-    const added = readFormParameters().filter((p) => !names.has(p.name.toLowerCase()));
-    if (added.length) {
-      $('parameters').value = [...existing, ...added.map((p) => `${p.name}: ${p.value}`)].join('\n');
-      found.push(`parametry: ${added.length}`);
-    }
-    saveDraft({ target: $('productName') });
-    setStatus('dataStatus', found.length
-      ? `Pobrano z formularza – ${found.join(', ')}. Sprawdź i popraw w razie potrzeby.`
-      : 'Nie znalazłem nowych danych w formularzu – wpisz je ręcznie.', !found.length);
-  }
-
-  function collectInput() {
-    const v = (id) => $(id).value.trim();
-    return {
-      productName: v('productName'),
-      keywords: lines(v('keywords')),
-      age: v('age'),
-      brand: v('brand'),
-      features: lines(v('features')),
-      benefits: lines(v('benefits')),
-      contents: lines(v('contents')),
-      parameters: lines(v('parameters')).map((l) => {
-        const i = l.indexOf(':');
-        return i > 0 ? { name: l.slice(0, i).trim(), value: l.slice(i + 1).trim() } : null;
-      }).filter(Boolean),
-      competitorTitles: lines(v('competitorTitles')),
-      caseStyle: v('caseStyle'),
-      allowWords: v('allowWords').split(',').map((s) => s.trim()).filter(Boolean),
-      socialProof: v('socialProof'),
-      promo: v('promo'),
-      extra: v('extra'),
-      smallParts: $('smallParts').checked,
-      condition: $('isNew').checked ? 'NEW' : 'USED',
-      date: new Date(),
-      title: state.title,
-    };
-  }
-
-  // --- tytuł ---
-  function setChosenTitle(title) {
-    state.title = title;
-    GM_setValue('title', title);
-    $('chosenTitle').value = title;
-    const input = collectInput();
-    const r = T.validateTitle(title, { topKeyword: input.keywords[0] || input.productName, allowWords: input.allowWords });
-    $('chosenInfo').textContent = title ? `${r.length}/${T.TITLE_MAX} znaków` : '';
-    msgs($('chosenMsgs'), title ? r.errors : [], title ? r.warnings : []);
-  }
-
-  function onChosenTitleInput() {
-    setChosenTitle($('chosenTitle').value);
-  }
-
-  async function onGenerateTitle() {
-    const input = collectInput();
-    if (!input.productName) return setStatus('titleStatus', 'Uzupełnij nazwę produktu w zakładce Dane.', true);
-    $('genTitle').disabled = true;
-    setStatus('titleStatus', 'Gemini pisze tytuły…');
-    try {
-      const res = await P.generateTitle(input, ask());
-      state.titleResults = res.results;
-      renderTitleResults(res.best);
-      if (res.best) {
-        setChosenTitle(res.best);
-        setStatus('titleStatus', `Gotowe (prób: ${res.attempts}). Najlepszy tytuł wybrany – możesz go zmienić.`);
-      } else {
-        setStatus('titleStatus', `Żadna propozycja nie spełnia reguł po ${res.attempts} próbach. Popraw ręcznie jedną z nich.`, true);
-      }
-    } catch (e) {
-      setStatus('titleStatus', e.message, true);
-    } finally {
-      $('genTitle').disabled = false;
-    }
-  }
-
-  function renderTitleResults(best) {
-    $('titleResults').replaceChildren(
-      ...state.titleResults.map((r) =>
-        el('div', { class: `card${r.ok ? ' ok' : ''}${r.title === best ? ' best' : ''}` },
-          el('div', {}, r.title),
-          el('div', {}, el('span', { class: 'len' }, `${r.length} znaków`), ` · próba ${r.attempt}${r.ok ? ' · ✔ OK' : ''}`),
-          el('ul', { class: 'msgs' }, ...r.errors.map((m) => el('li', { class: 'e' }, m)), ...r.warnings.map((m) => el('li', { class: 'w' }, m))),
-          el('button', { class: 'btn small', on: { click: () => setChosenTitle(r.title) } }, 'Wybierz'),
-          el('button', { class: 'btn small sec', on: { click: () => copy(r.title) } }, 'Kopiuj'),
-        )),
+  function refreshForm() {
+    state.form = readForm();
+    if (state.form.name && !$('productName').value.trim()) $('productName').value = state.form.name;
+    const p = state.form.parameters;
+    $('catalogInfo').replaceChildren(
+      el('b', {}, `Z formularza: ${p.length} parametrów, ${state.form.imageUrls.length} zdjęć`),
+      p.length ? el('details', {}, el('summary', {}, 'Pokaż parametry'), el('ul', { class: 'msgs' }, ...p.map((x) => el('li', {}, `${x.name}: ${x.value}`)))) : el('div', { class: 'muted' }, 'Wybierz produkt z katalogu w formularzu Allegro i kliknij „Odśwież”.'),
     );
+    setMode(currentMode());
+    renderPhotos();
+  }
+
+  function photoList() {
+    const user = state.userPhotos.map((p, i) => ({ src: p.preview, tag: 'Twoje', remove: () => state.userPhotos.splice(i, 1) }));
+    const form = state.form.imageUrls.map((u) => ({ src: u, tag: 'formularz' }));
+    return [...user, ...form].slice(0, MAX_PHOTOS);
+  }
+
+  function renderPhotos() {
+    const list = photoList();
+    $('photoInfo').textContent = `– ${list.length}/${MAX_PHOTOS}${list.length ? '' : ': kliknij, przeciągnij albo wklej Ctrl+V'}`;
+    $('drop').replaceChildren(
+      ...list.map((p) => el('div', { class: 'thumb' },
+        el('img', { src: p.src, alt: '' }),
+        el('span', { class: 'tag' }, p.tag),
+        p.remove ? el('button', { title: 'Usuń', on: { click: (e) => { e.stopPropagation(); p.remove(); renderPhotos(); } } }, '×') : null)),
+      list.length < MAX_PHOTOS ? el('span', { class: 'muted' }, list.length ? '+ dodaj' : 'Kliknij, przeciągnij zdjęcie albo wklej Ctrl+V') : null,
+    );
+  }
+
+  async function addFiles(files) {
+    for (const f of [...files].filter((x) => x.type.startsWith('image/'))) {
+      if (state.userPhotos.length >= MAX_PHOTOS) break;
+      try {
+        state.userPhotos.push(await preparePhoto(f));
+      } catch (e) {
+        setStatus('status', `Nie udało się wczytać zdjęcia: ${e.message}`, true);
+      }
+    }
+    fileInput.value = '';
+    renderPhotos();
+  }
+
+  /** Zdjęcia do wysłania: Twoje + z formularza (pobierane dopiero teraz), max 4. */
+  async function collectPhotos() {
+    const photos = state.userPhotos.slice(0, MAX_PHOTOS);
+    for (const url of state.form.imageUrls) {
+      if (photos.length >= MAX_PHOTOS) break;
+      try {
+        photos.push(await fetchPhoto(url));
+      } catch (e) {
+        // zdjęcie z formularza niedostępne – pomijamy
+      }
+    }
+    return photos;
+  }
+
+  // --- generowanie ---
+  async function onGenerate() {
+    refreshForm();
+    const mode = currentMode();
+    const productName = $('productName').value.trim();
+    if (!settings.apiKey) {
+      showTab('settings');
+      return setStatus('settingsStatus', 'Najpierw wklej klucz API Gemini i kliknij Zapisz.', true);
+    }
+    if (!productName && !state.userPhotos.length && !state.form.imageUrls.length) {
+      return setStatus('status', 'Dodaj zdjęcie albo wpisz nazwę produktu.', true);
+    }
+    $('generate').disabled = true;
+    const started = Date.now();
+    let phase = 'Przygotowuję zdjęcia…';
+    const tick = () => setStatus('status', `${phase} ${Math.round((Date.now() - started) / 1000)} s`);
+    tick();
+    const timer = setInterval(tick, 1000);
+    try {
+      const images = await collectPhotos();
+      state.searchQueries = [];
+      const input = {
+        mode,
+        productName,
+        extra: $('extra').value.trim(),
+        parameters: state.form.parameters,
+        images,
+        search: settings.search,
+        caseStyle: settings.caseStyle,
+        promo: $('promo').value.trim(),
+        socialProof: $('socialProof').value.trim(),
+        allowWords: $('allowWords').value.split(',').map((s) => s.trim()).filter(Boolean),
+        date: new Date(),
+      };
+      state.result = await L.generateListing(input, ask(), { onProgress: (m) => { phase = m; tick(); } });
+      renderResult();
+      const secs = Math.round((Date.now() - started) / 1000);
+      const r = state.result;
+      setStatus('status', r.title.ok && r.description.ok
+        ? `Gotowe w ${secs} s. Sprawdź i wstaw tytuł, potem skopiuj opis.`
+        : `Gotowe w ${secs} s, ale ${!r.title.ok ? 'tytuł' : 'opis'} nadal łamie reguły – popraw ręcznie (czerwone uwagi).`, !(r.title.ok && r.description.ok));
+    } catch (e) {
+      setStatus('status', e.message, true);
+    } finally {
+      clearInterval(timer);
+      $('generate').disabled = false;
+    }
+  }
+
+  // --- wyniki ---
+  function renderResult() {
+    const r = state.result;
+    $('results').hidden = false;
+    $('keywords').replaceChildren(...r.research.keywords.map((k, i) => el('span', { class: `chip${i === 0 ? ' top' : ''}` }, k)));
+    $('searched').textContent = state.searchQueries.length ? `Gemini szukał w Google: ${state.searchQueries.join(' · ')}` : '';
+    $('title').value = r.title.value;
+    $('altTitlesSummary').textContent = `Inne propozycje (${r.title.results.length})`;
+    $('altTitles').replaceChildren(...r.title.results.map((t) =>
+      el('div', { class: `card${t.ok ? ' ok' : ''}` },
+        el('div', {}, t.title),
+        el('div', { class: 'muted' }, `${t.length} znaków${t.ok ? ' · ✔ OK' : ''}`),
+        el('ul', { class: 'msgs' }, ...t.errors.map((m) => el('li', { class: 'e' }, m))),
+        el('button', { class: 'btn small', on: { click: () => { $('title').value = t.title; refreshDescription(); } } }, 'Wybierz'))));
+    $('smallParts').checked = !!r.descInput.smallParts;
+    $('isNew').checked = r.descInput.condition === 'NEW';
+    refreshDescription();
+  }
+
+  /** Przelicza tytuł i opis lokalnie (bez Gemini) po zmianie tytułu lub przełączników. */
+  function refreshDescription() {
+    const r = state.result;
+    if (!r) return;
+    const title = $('title').value.trim();
+    const tv = T.validateTitle(title, { topKeyword: r.titleInput.keywords[0] || r.titleInput.productName, allowWords: r.titleInput.allowWords });
+    $('titleInfo').textContent = `${tv.length}/${T.TITLE_MAX} znaków`;
+    msgs($('titleMsgs'), tv.errors, tv.warnings);
+
+    const input = { ...r.descInput, title, smallParts: $('smallParts').checked, condition: $('isNew').checked ? 'NEW' : 'USED' };
+    const v = D.validateDescription(r.description.content, input);
+    state.current = v;
+    msgs($('descMsgs'), v.errors, v.warnings);
+    $('descSections').replaceChildren(...v.description.sections.map((s, i) => {
+      const html = D.toAllegroHtml(s.blocks);
+      const preview = el('div', { class: 'preview' });
+      preview.innerHTML = html; // HTML z toAllegroHtml – tekst jest escapowany
+      return el('div', { class: 'card' },
+        el('div', { class: 'hint' }, `Sekcja ${i + 1}: ${s.layout === 'TEXT' ? 'sam tekst' : `zdjęcie po lewej – ${s.imageHint}`}`),
+        preview,
+        el('button', { class: 'btn small', on: { click: () => copy(html, true) } }, 'Kopiuj sekcję'),
+        el('button', { class: 'btn small sec', on: { click: () => copy(s.blocks.map((b) => b.text.replace(/\*\*/g, '')).join('\n')) } }, 'Kopiuj tekst'));
+    }));
+  }
+
+  function copyAll(html) {
+    if (!state.current) return;
+    const d = state.current.description;
+    copy(html ? d.sections.map((s) => D.toAllegroHtml(s.blocks)).join('') : D.toPlainText(d), html);
+    setStatus('status', 'Skopiowano opis do schowka.');
   }
 
   function insertTitle() {
+    const title = $('title').value.trim();
     const input = findTitleInput();
     if (!input) {
-      copy(state.title);
-      return setStatus('titleStatus', 'Nie znalazłem pola tytułu na stronie – tytuł skopiowany do schowka.', true);
+      copy(title);
+      return setStatus('status', 'Nie znalazłem pola tytułu na stronie – tytuł skopiowany do schowka.', true);
     }
-    setNativeValue(input, state.title);
+    setNativeValue(input, title);
     input.focus();
-    setStatus('titleStatus', 'Tytuł wstawiony do formularza.');
-  }
-
-  // --- opis ---
-  async function onGenerateDescription() {
-    const input = collectInput();
-    if (!input.title) return setStatus('descStatus', 'Najpierw wybierz tytuł w zakładce Tytuł.', true);
-    $('genDesc').disabled = true;
-    setStatus('descStatus', 'Gemini pisze opis…');
-    msgs($('descMsgs'));
-    try {
-      const res = await P.generateDescription(input, ask());
-      state.description = res;
-      renderDescription(res);
-      setStatus('descStatus', res.ok
-        ? `Gotowe (prób: ${res.attempts}).${res.warnings.length ? ' Sprawdź ostrzeżenia.' : ''}`
-        : `Opis nadal ma błędy po ${res.attempts} próbach – popraw je przed wklejeniem.`, !res.ok);
-    } catch (e) {
-      setStatus('descStatus', e.message, true);
-    } finally {
-      $('genDesc').disabled = false;
-    }
-  }
-
-  function renderDescription(res) {
-    msgs($('descMsgs'), res.errors, res.warnings);
-    $('descSections').replaceChildren(
-      ...res.description.sections.map((s, i) => {
-        const html = D.toAllegroHtml(s.blocks);
-        const preview = el('div', { class: 'preview' });
-        preview.innerHTML = html; // HTML z toAllegroHtml – tekst jest escapowany
-        return el('div', { class: 'card' },
-          el('div', { class: 'hint' }, `Sekcja ${i + 1}: ${s.layout === 'TEXT' ? 'sam tekst' : `zdjęcie po lewej – ${s.imageHint}`}`),
-          preview,
-          el('button', { class: 'btn small', on: { click: () => copy(html, true) } }, 'Kopiuj sekcję'),
-          el('button', { class: 'btn small sec', on: { click: () => copy(s.blocks.map((b) => b.text.replace(/\*\*/g, '')).join('\n')) } }, 'Kopiuj tekst'),
-        );
-      }),
-    );
-  }
-
-  function copyApiJson() {
-    if (!state.description) return;
-    copy(JSON.stringify(D.toAllegroApiDescription(state.description.description, []), null, 2));
+    setStatus('status', 'Tytuł wstawiony do formularza.');
   }
 
   // --- ustawienia ---
   function saveSettings() {
-    settings.save($('apiKey').value, $('model').value);
+    settings.save({ apiKey: $('apiKey').value, model: $('model').value, caseStyle: $('caseStyle').value, search: $('search').checked });
     setStatus('settingsStatus', 'Zapisano.');
+    if (settings.apiKey) setTimeout(() => showTab('gen'), 600);
   }
 
   async function loadModels() {
@@ -1575,13 +1887,12 @@ function buildUi() {
     }
   }
 
-  loadDraft();
-  setChosenTitle(state.title);
+  renderPhotos();
+  setMode('NEW');
 
   // Sales Center to SPA – przycisk tylko na stronach /offer…
   const syncVisibility = () => {
-    const onOffer = OFFER_PATH.test(location.pathname);
-    host.style.display = onOffer ? '' : 'none';
+    host.style.display = OFFER_PATH.test(location.pathname) ? '' : 'none';
   };
   syncVisibility();
   setInterval(syncVisibility, 1000);

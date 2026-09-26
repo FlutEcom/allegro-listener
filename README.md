@@ -11,21 +11,40 @@ Tytuł i opis generuje Gemini według reguł z katalogu `rules/`.
    zaproponuje instalację. (Albo: Tampermonkey → „Utwórz nowy skrypt” → wklej zawartość pliku.)
 3. Wejdź na `https://salescenter.allegro.com/offer…` – w prawym dolnym rogu pojawi się przycisk **✨ AI oferta**.
 4. Zakładka **Ustawienia**: wklej klucz API Gemini (Google AI Studio → „Get API key”) i zapisz.
-   Domyślny model to `gemini-3.8-flash`; przycisk „Pobierz listę modeli” pokaże modele dostępne dla Twojego klucza.
+   Domyślny model to `gemini-3.8-flash`. Przycisk „Pobierz listę modeli” pokaże modele dostępne dla Twojego klucza.
    Klucz jest zapisywany tylko w Tampermonkey na Twoim komputerze.
 
 ## Jak używać
 
-1. **Dane** – „Pobierz z formularza” zbiera nazwę i parametry z formularza Allegro. Uzupełnij resztę:
-   frazy kluczowe (od najpopularniejszej – Google Trends), cechy, korzyści, zawartość zestawu,
-   tytuły TOP 10 konkurencji (do wyboru stylu liter), prawdziwy social proof i promocję.
-   Dane zapisują się automatycznie.
-2. **Tytuł** – „Generuj tytuł”: Gemini daje kilka propozycji, walidator wybiera najlepszą (70–75 znaków,
-   bez zakazanych słów). Możesz ją poprawić ręcznie i kliknąć „Wstaw do formularza”.
-3. **Opis** – „Generuj opis”: sekcje w kolejności z `rules/02-opis.md`, z podpowiedzią, jakie zdjęcie
-   dać po lewej. „Kopiuj sekcję” kopiuje sformatowany tekst do wklejenia w edytor opisu Allegro.
+Wystawienie oferty to kilka sekund pracy. Resztę robi Gemini:
 
-Jeśli Gemini zwróci tekst łamiący reguły, wtyczka sama odsyła mu listę błędów (maks. 2 poprawki).
+- rozpoznaje produkt ze zdjęć,
+- wyszukuje w Google słowa kluczowe i tytuły konkurencji,
+- pisze tytuł i opis według reguł.
+
+Wtyczka sprawdza wynik i sama prosi Gemini o poprawki (maks. 2).
+
+**Nowy produkt** (spoza katalogu):
+1. Dodaj zdjęcie: kliknij, przeciągnij albo wklej Ctrl+V (max 4). Zdjęcia wgrane już do formularza
+   Allegro wtyczka dołącza sama.
+2. Wpisz nazwę produktu. Opcjonalnie dodaj informacje, których nie widać na zdjęciu
+   (wymiary, wiek, zawartość).
+3. **⚡ Generuj tytuł i opis**.
+
+**Z katalogu:**
+1. Wybierz produkt z katalogu w formularzu Allegro.
+2. Otwórz panel. Nazwa, parametry i zdjęcia z formularza wczytają się same.
+3. **⚡ Generuj tytuł i opis**.
+
+**Wynik:**
+- Tytuł: kliknij „Wstaw do formularza”.
+- Opis: „Kopiuj cały opis” albo „Kopiuj sekcję”, do wklejenia w edytor opisu Allegro. Każda sekcja ma
+  podpowiedź, jakie zdjęcie dać po lewej.
+- Zmiana tytułu albo przełączników „Małe elementy” / „Produkt nowy” od razu przelicza opis, bez pytania Gemini.
+
+W **Ustawieniach** można:
+- wyłączyć wyszukiwanie w Google (szybciej, ale mniej dokładne słowa kluczowe),
+- ustawić stały styl liter w tytule.
 
 ## Reguły
 
@@ -42,6 +61,6 @@ npm test        # build + testy
 ```
 
 - `src/lib/gemini.js` – klient Gemini API (generateContent, lista modeli)
-- `src/lib/pipeline.js` – prompt → Gemini → walidacja → poprawka
+- `src/lib/listing.js` – jedno zapytanie „wszystko w jednym” → walidacja → poprawki
 - `src/userscript/main.js` – panel na stronie Sales Center
 - `dist/allegro-listener.user.js` – plik generowany, nie edytuj ręcznie

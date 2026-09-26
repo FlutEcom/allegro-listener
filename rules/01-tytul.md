@@ -24,10 +24,12 @@ który sprawdza każdy wygenerowany tytuł przed wstawieniem go do formularza
 - Tytuł **zaczyna się od frazy, którą klienci najczęściej wpisują w
   wyszukiwarkę** – zwykle nazwa produktu + wyróżniająca go cecha lub korzyść.
 - Najpopularniejsze słowo kluczowe jest **pierwszym słowem** tytułu.
-- Popularność fraz sprawdzamy w **Google Trends** (porównanie wariantów, np.
-  „klocki konstrukcyjne” vs „klocki dla dzieci”) oraz w podpowiedziach
-  wyszukiwarki Allegro. Lista fraz trafia do promptu posortowana od
-  najpopularniejszej – Gemini nie zgaduje popularności, tylko ją respektuje.
+- Popularność fraz sprawdza **Gemini z wyszukiwarką Google**: porównuje warianty
+  w Google Trends (np. „klocki konstrukcyjne” vs „klocki dla dzieci”), podpowiedzi
+  wyszukiwania i oferty na allegro.pl. Zwraca 5–8 fraz od najpopularniejszej;
+  pierwsza to TOP KEYWORD. Panel pokazuje, czego Gemini szukał, więc można to
+  sprawdzić. Wyszukiwanie można wyłączyć w ustawieniach (szybciej, ale frazy
+  pochodzą wtedy tylko z wiedzy modelu).
 
 ## 3. Struktura
 
@@ -60,6 +62,9 @@ Przykład (73 znaki):
 - Tryb `AUTO` (domyślny): jeśli ≥ 50% tytułów konkurencji jest pisanych
   CAPSLOCKIEM → `UPPER`, w przeciwnym razie → `TITLE`.
   Brak danych o konkurencji → `UPPER`.
+- Tytuły konkurencji wyszukuje Gemini (do 10). Gdy znajdzie co najmniej 3,
+  styl liczy walidator; w przeciwnym razie przyjmujemy styl wskazany przez
+  Gemini. Styl można też ustawić na stałe w ustawieniach wtyczki.
 - Oznaczenia modeli/jednostek zachowują swój zapis w trybie `TITLE`
   (`USB-C`, `LED`, `XXL`, `cm`, `ml`).
 

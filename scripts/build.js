@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const MODULES = ['src/rules/title.js', 'src/rules/description.js', 'src/lib/gemini.js', 'src/lib/pipeline.js', 'src/userscript/main.js'];
+const MODULES = ['src/rules/title.js', 'src/rules/description.js', 'src/lib/gemini.js', 'src/lib/listing.js', 'src/userscript/main.js'];
 const OUT = path.join(ROOT, 'dist', 'allegro-listener.user.js');
 
 function build() {
