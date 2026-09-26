@@ -1,0 +1,9 @@
+{
+  "name": "allegro-listener",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wtyczka Tampermonkey do szybkiego wystawiania ofert na Allegro z tytułem i opisem generowanym przez Gemini",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
