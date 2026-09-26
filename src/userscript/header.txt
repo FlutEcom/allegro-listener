@@ -1,0 +1,14 @@
+// ==UserScript==
+// @name         Allegro Listener – AI tytuł i opis
+// @namespace    https://github.com/FlutEcom/allegro-listener
+// @version      {{VERSION}}
+// @description  Szybkie wystawianie ofert: Gemini pisze tytuł i opis wg reguł z rules/
+// @match        https://salescenter.allegro.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @connect      generativelanguage.googleapis.com
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==

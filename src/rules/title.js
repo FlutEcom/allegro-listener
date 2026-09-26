@@ -301,6 +301,18 @@ ${report}
 Popraw te błędy. Każdy nowy tytuł musi mieć ${TITLE_MIN}–${TITLE_MAX} znaków i spełniać wszystkie reguły.`;
   }
 
+  /** Schemat odpowiedzi dla Gemini (generationConfig.responseSchema). */
+  const TITLE_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+      candidates: {
+        type: 'ARRAY',
+        items: { type: 'OBJECT', properties: { title: { type: 'STRING' }, length: { type: 'INTEGER' } }, required: ['title'] },
+      },
+    },
+    required: ['candidates'],
+  };
+
   return {
     TITLE_MIN,
     TITLE_MAX,
@@ -308,6 +320,7 @@ Popraw te błędy. Każdy nowy tytuł musi mieć ${TITLE_MIN}–${TITLE_MAX} zna
     FORBIDDEN_WORDS,
     FORBIDDEN_PATTERNS,
     RULES_TEXT,
+    TITLE_SCHEMA,
     detectCaseStyle,
     applyCase,
     normalizeTitle,
