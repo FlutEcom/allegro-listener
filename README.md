@@ -38,8 +38,12 @@ Wtyczka sprawdza wynik i sama prosi Gemini o poprawki (maks. 2).
 
 **Wynik:**
 - Tytuł: kliknij „Wstaw do formularza”.
-- Opis: „Kopiuj cały opis” albo „Kopiuj sekcję”, do wklejenia w edytor opisu Allegro. Każda sekcja ma
-  podpowiedź, jakie zdjęcie dać po lewej.
+- Opis: „Wstaw opis do formularza” podmienia opis w edytorze Allegro (np. opis z katalogu) na opis od Gemini:
+  sekcja 1 trafia do pierwszego pola tekstu, sekcja 2 do drugiego itd.; nadmiarowe sekcje trafiają do ostatniego
+  pola, a nadmiarowe stare pola są czyszczone. Puste sekcje i stare zdjęcia usuwasz w edytorze Allegro.
+  Jeśli wstawianie nie zadziała, opis zostaje skopiowany do schowka (Ctrl+V w edytorze), a w Ustawieniach
+  „Skopiuj budowę edytora opisu” kopiuje strukturę edytora (bez treści) – do dopasowania wtyczki.
+- Każda sekcja ma podpowiedź, jakie zdjęcie dać po lewej, i przyciski „Kopiuj sekcję” / „Kopiuj tekst”.
 - Zmiana tytułu albo przełączników „Małe elementy” / „Produkt nowy” od razu przelicza opis, bez pytania Gemini.
 
 W **Ustawieniach** można:

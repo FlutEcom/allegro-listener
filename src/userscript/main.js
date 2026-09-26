@@ -189,6 +189,112 @@ function setNativeValue(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+// ---------- edytor opisu ----------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const squash = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+
+/** Edytowalne pola tekstu opisu (contenteditable) – bez zagnieżdżonych i bez panelu wtyczki. */
+function findDescriptionEditors() {
+  return visibleFields('[contenteditable="true"], [contenteditable=""]')
+    .filter((el) => !(el.parentElement && el.parentElement.closest('[contenteditable="true"], [contenteditable=""]')));
+}
+
+function selectContents(editor) {
+  editor.focus();
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+/** Czyści edytor i ustawia pusty akapit (bez resztek starego nagłówka z katalogu). */
+function clearToParagraph(editor) {
+  selectContents(editor);
+  document.execCommand('delete');
+  document.execCommand('formatBlock', false, 'p');
+}
+
+/**
+ * Zastępuje treść edytora: najpierw jak wklejenie (edytory rich-text obsługują zdarzenie paste),
+ * a gdy to nie zadziała – execCommand('insertHTML').
+ */
+async function replaceEditorContent(editor, html, text) {
+  const probe = squash(text).slice(0, 40);
+  const done = () => (probe ? squash(editor.innerText).includes(probe) : !squash(editor.innerText));
+  selectContents(editor);
+  if (html) {
+    const dt = new DataTransfer();
+    dt.setData('text/html', html);
+    dt.setData('text/plain', text);
+    editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    await sleep(150);
+    if (done()) return true;
+    clearToParagraph(editor);
+    document.execCommand('insertHTML', false, html);
+  } else {
+    clearToParagraph(editor);
+  }
+  await sleep(150);
+  return done();
+}
+
+/**
+ * Wstawia opis do edytora Allegro: sekcja 1 → pole 1, sekcja 2 → pole 2…,
+ * nadmiarowe sekcje opisu trafiają do ostatniego pola, nadmiarowe pola (np. opis z katalogu) są czyszczone.
+ * @returns {Promise<{ok: boolean, editors: number, cleared: number}>}
+ */
+async function insertDescriptionIntoForm(sections) {
+  const editors = findDescriptionEditors();
+  if (!editors.length) return { ok: false, editors: 0, cleared: 0 };
+  let ok = true;
+  let cleared = 0;
+  for (let i = 0; i < editors.length; i++) {
+    const last = i === editors.length - 1;
+    const part = last ? sections.slice(i) : sections.slice(i, i + 1);
+    if (!part.length) {
+      await replaceEditorContent(editors[i], '', '');
+      cleared++;
+      continue;
+    }
+    const html = part.map((s) => D.toAllegroHtml(s.blocks)).join('');
+    const text = part.map((s) => s.blocks.map((b) => b.text.replace(/\*\*/g, '')).join('\n')).join('\n\n');
+    ok = (await replaceEditorContent(editors[i], html, text)) && ok;
+  }
+  return { ok, editors: editors.length, cleared };
+}
+
+/** Uproszczona budowa edytora opisu (bez treści) – do dopasowania wtyczki do Sales Center. */
+function describeDescriptionDom() {
+  let root = null;
+  const editors = findDescriptionEditors();
+  if (editors.length) {
+    root = editors[0];
+    for (let i = 0; i < 8 && root.parentElement && root.parentElement !== document.body; i++) root = root.parentElement;
+  } else {
+    const heading = [...document.querySelectorAll('h1, h2, h3, h4, legend, label, span, div')]
+      .find((e) => e.children.length === 0 && /^opis( oferty| produktu)?$/i.test(squash(e.textContent)));
+    root = heading && (heading.closest('section, fieldset, form') || heading.parentElement.parentElement.parentElement);
+  }
+  if (!root) return 'Nie znaleziono edytora opisu ani nagłówka „Opis”.';
+  const lines = [`URL: ${location.pathname}`, `Pola contenteditable: ${editors.length}`];
+  const walk = (node, depth) => {
+    if (lines.length > 400 || depth > 16 || node.id === 'allegro-listener-root') return;
+    const a = (n) => node.getAttribute(n);
+    const cls = (node.getAttribute('class') || '').split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+    const parts = [node.tagName.toLowerCase() + (node.id ? `#${node.id}` : '') + (cls ? `.${cls}` : '')];
+    for (const n of ['role', 'aria-label', 'title', 'data-testid', 'data-role', 'contenteditable', 'type', 'name']) if (a(n) != null) parts.push(`${n}="${a(n).slice(0, 40)}"`);
+    if (/^(BUTTON|A|LABEL|H\d|LEGEND)$/.test(node.tagName) || a('role') === 'button') parts.push(`"${squash(node.textContent).slice(0, 40)}"`);
+    if (node.tagName === 'IMG') parts.push(`src=${(node.src || '').split('/')[2] || ''}`);
+    lines.push('  '.repeat(depth) + parts.join(' '));
+    if (a('contenteditable') != null) return; // bez treści opisu
+    for (const c of node.children) walk(c, depth + 1);
+  };
+  walk(root, 0);
+  return lines.join('\n');
+}
+
 function copy(text, html) {
   GM_setClipboard(text, html ? 'html' : 'text');
 }
@@ -314,7 +420,8 @@ function buildUi() {
         el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'isNew', checked: true, on: { change: refreshDescription } }), 'Produkt nowy'),
       ),
       el('ul', { class: 'msgs', id: 'descMsgs' }),
-      el('button', { class: 'btn', on: { click: () => copyAll(true) } }, 'Kopiuj cały opis'),
+      el('button', { class: 'btn', id: 'insertDesc', on: { click: insertDescription } }, 'Wstaw opis do formularza'),
+      el('button', { class: 'btn sec', on: { click: () => copyAll(true) } }, 'Kopiuj cały opis'),
       el('button', { class: 'btn sec', on: { click: () => copyAll(false) } }, 'Kopiuj sam tekst'),
       el('div', { id: 'descSections' }),
     ),
@@ -336,6 +443,10 @@ function buildUi() {
       'Szukaj słów kluczowych w Google (Trends, Allegro) – dokładniej, ale wolniej'),
     el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz'),
     el('button', { class: 'btn sec', on: { click: loadModels } }, 'Pobierz listę modeli'),
+    el('button', { class: 'btn sec', on: { click: () => {
+      copy(describeDescriptionDom());
+      setStatus('settingsStatus', 'Skopiowano budowę edytora opisu (bez treści). Wklej ją w rozmowie z autorem wtyczki.');
+    } } }, 'Skopiuj budowę edytora opisu'),
     el('div', { class: 'status', id: 'settingsStatus' }),
   );
   settingsTab.querySelector('#caseStyle').value = settings.caseStyle;
@@ -561,6 +672,28 @@ function buildUi() {
     const d = state.current.description;
     copy(html ? d.sections.map((s) => D.toAllegroHtml(s.blocks)).join('') : D.toPlainText(d), html);
     setStatus('status', 'Skopiowano opis do schowka.');
+  }
+
+  async function insertDescription() {
+    if (!state.current) return;
+    $('insertDesc').disabled = true;
+    try {
+      const r = await insertDescriptionIntoForm(state.current.description.sections);
+      if (!r.editors) {
+        copyAll(true);
+        setStatus('status', 'Nie znalazłem pola opisu na stronie – opis skopiowany. Kliknij w tekst opisu, Ctrl+A i Ctrl+V. '
+          + 'Jeśli to się powtarza: Ustawienia → „Skopiuj budowę edytora opisu” i wyślij to autorowi wtyczki.', true);
+      } else if (!r.ok) {
+        copyAll(true);
+        setStatus('status', `Pole opisu znalezione (${r.editors}), ale edytor nie przyjął tekstu – opis skopiowany, wklej go ręcznie (Ctrl+V). `
+          + 'Ustawienia → „Skopiuj budowę edytora opisu” pomoże to naprawić.', true);
+      } else {
+        setStatus('status', `Opis wstawiony (pól tekstu: ${r.editors}${r.cleared ? `, wyczyszczone stare: ${r.cleared}` : ''}). `
+          + 'Sprawdź formularz – puste sekcje i stare zdjęcia z katalogu usuń w edytorze Allegro.');
+      }
+    } finally {
+      $('insertDesc').disabled = false;
+    }
   }
 
   function insertTitle() {
