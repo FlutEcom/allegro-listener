@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Allegro Listener – AI tytuł i opis
 // @namespace    https://github.com/FlutEcom/allegro-listener
-// @version      0.3.0
+// @version      0.3.1
 // @description  Błyskawiczne wystawianie ofert: zdjęcie + nazwa → Gemini pisze tytuł i opis wg reguł z rules/
 // @match        https://salescenter.allegro.com/*
 // @grant        GM_getValue
@@ -515,6 +515,58 @@ Popraw te błędy. Każdy nowy tytuł musi mieć ${TITLE_MIN}–${TITLE_MAX} zna
     return input.occasions && input.occasions.length ? { occasions: input.occasions, emoji: auto.emoji } : auto;
   }
 
+  // ---------- specyfikacja ----------
+
+  // Jedyne wiersze specyfikacji, w tej kolejności. Klucze nazw: małe litery, bez polskich znaków.
+  const SPEC_FIELDS = [
+    { label: 'Wymiary', match: [/^(wymiary|rozmiar)\b/], parts: /^(dlugosc|szerokosc|wysokosc|glebokosc)\b/ },
+    { label: 'Liczba sztuk', match: [/^(liczba|ilosc) (sztuk|elementow|czesci)\b/] },
+    { label: 'Wiek dziecka', match: [/^wiek( dziecka)?\b/, /^minimalny wiek\b/], age: true },
+  ];
+
+  function specKey(name) {
+    return searchKey(name).trim().replace(/ opcjonalnie$/, '');
+  }
+
+  /** Sam numer wieku („3”) → „od 3 lat”. */
+  function formatAge(value) {
+    const v = String(value).trim();
+    if (!/^\d+$/.test(v)) return v;
+    return v === '1' ? 'od 1 roku' : `od ${v} lat`;
+  }
+
+  function findSpecValue(field, list) {
+    for (const re of field.match) {
+      const hit = list.find((p) => re.test(specKey(p.name)));
+      if (hit) return field.age ? formatAge(hit.value) : String(hit.value).trim();
+    }
+    if (field.parts) {
+      const parts = list.filter((p) => field.parts.test(specKey(p.name)));
+      if (parts.length >= 2) return parts.map((p) => String(p.value).trim()).join(' × ');
+    }
+    return '';
+  }
+
+  /**
+   * Wiersze specyfikacji: wymiary, liczba sztuk, wiek dziecka – nic więcej.
+   * @param {Array<Array<{name: string, value: string}>|undefined>} sources  od najważniejszego (formularz, potem Gemini)
+   * @param {string} [age]  wiek rozpoznany przez Gemini – gdy żadne źródło go nie podaje
+   */
+  function pickSpec(sources, age) {
+    const lists = sources.map((s) => (s || []).filter((p) => p && p.name && p.value && String(p.value).trim()));
+    const rows = [];
+    for (const field of SPEC_FIELDS) {
+      let value = '';
+      for (const list of lists) {
+        value = findSpecValue(field, list);
+        if (value) break;
+      }
+      if (!value && field.age && age) value = formatAge(age);
+      if (value) rows.push({ name: field.label, value });
+    }
+    return rows;
+  }
+
   // ---------- składanie opisu ----------
 
   function h(type, text) {
@@ -580,16 +632,9 @@ Popraw te błędy. Każdy nowy tytuł musi mieć ${TITLE_MIN}–${TITLE_MAX} zna
       ...(gift.paragraph ? [h('p', stripLead(gift.paragraph))] : []),
     ]);
 
-    // SEKCJA 6: specyfikacja – parametry sprzedawcy mają pierwszeństwo
-    const params = [...(input.parameters || [])];
-    const known = new Set(params.map((p) => searchKey(p.name)));
-    for (const p of content.spec || []) {
-      if (p && p.name && p.value && !known.has(searchKey(p.name))) {
-        params.push(p);
-        known.add(searchKey(p.name));
-      }
-    }
-    const specBlocks = [...heading('⚙️', spaced('SPECYFIKACJA')), ...params.map((p) => h('p', `**${stripEndDot(p.name)}:** ${p.value}`))];
+    // SEKCJA 6: specyfikacja – tylko wymiary, liczba sztuk i wiek dziecka
+    const specRows = pickSpec([input.parameters, content.spec], input.age);
+    const specBlocks = [...heading('⚙️', spaced('SPECYFIKACJA')), ...specRows.map((p) => h('p', `**${p.name}:** ${p.value}`))];
     if (input.smallParts) specBlocks.push(h('p', `❗ ${SMALL_PARTS_WARNING}`));
     if (!input.condition || input.condition === 'NEW') specBlocks.push(h('p', `✅ ${NEW_PRODUCT_SENTENCE}`));
     section('spec', specBlocks);
@@ -837,7 +882,7 @@ SEKCJE (pola JSON):
 - glossary: 0–3 trudne pojęcia użyte w opisie (np. motoryka mała, Montessori) z prostym wyjaśnieniem.
 - contents: heading = zaleta zestawu (np. „500 koralików i wszystko, czego potrzeba”), items = elementy zestawu, sizeNote = rozmiar w odniesieniu do dziecka (tylko jeśli znasz wymiary, inaczej pusty).
 - gift: heading i 1 akapit o prezencie na podane okazje.
-- spec: parametry tylko z danych produktu (nazwa + wartość).
+- spec: tylko 3 parametry, z nazwami dokładnie: „Wymiary” (np. 6,5 cm x 4 cm x 4 cm), „Liczba sztuk” (ile sztuk lub elementów w opakowaniu), „Wiek dziecka” (np. 3 lata +). Nic więcej. Pomiń parametr, którego nie znasz z danych.
 - faq: 3–5 pytań, które zadają rodzice (od ilu lat, baterie, bezpieczeństwo, przechowywanie, prezent). Odpowiedzi krótkie, tylko z danych. Nie zadawaj pytań, na które nie znasz odpowiedzi.
 - closing: 1 ciepłe zdanie na koniec, bez presji.`.trim();
 
@@ -912,6 +957,7 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
     occasionsFor,
     spaced,
     findDisallowedEmoji,
+    pickSpec,
     buildDescription,
     toAllegroHtml,
     toAllegroApiDescription,
@@ -1442,7 +1488,10 @@ function findTitleInput() {
 }
 
 // Pola formularza, które nie są parametrami produktu.
-const NOT_PARAMETER = /tytu[łl]|opis|cen[ay]|price|ilo[śs][ćc]|liczba sztuk|sygnatura|sku|\bean\b|gtin|kod|koszt|wysy[łl]k|dostaw|cennik|faktur|vat|termin|zwrot|reklamac|gwarancj|promowan|waluta|czas trwania/i;
+// „Liczba sztuk” bez dopisku to stan magazynowy oferty, a nie liczba sztuk w zestawie.
+const NOT_PARAMETER = /tytu[łl]|opis|cen[ay]|price|ilo[śs][ćc]|liczba sztuk(?! w (zestawie|opakowaniu|komplecie))|sygnatura|sku|\bean\b|gtin|kod|koszt|wysy[łl]k|dostaw|cennik|faktur|vat|termin|zwrot|reklamac|gwarancj|promowan|waluta|czas trwania|wybierz|\bdata\b|producent|bezpiecze[ńn]st|odpowiedzialn/i;
+// Podpowiedzi pól zamiast wartości („Wybierz…”, „ustaw tekst”).
+const PLACEHOLDER_VALUE = /^(wybierz|ustaw)\b/i;
 
 function fieldLabel(el) {
   const own = labelText(el) || el.getAttribute('aria-label') || '';
@@ -1459,8 +1508,8 @@ function readFormParameters() {
   for (const el of visibleFields('input[type="text"], input[type="number"], input:not([type]), select, [role="combobox"]')) {
     const name = fieldLabel(el).replace(/\s+/g, ' ').replace(/[*:]\s*$/, '').trim();
     let value = el.tagName === 'SELECT' ? (el.selectedOptions[0] || {}).textContent : el.value ?? el.textContent;
-    value = String(value || '').replace(/\s+/g, ' ').trim();
-    if (!name || !value || name.length > 60 || NOT_PARAMETER.test(name) || /^wybierz/i.test(value) || seen.has(name.toLowerCase())) continue;
+    value = String(value || '').replace(/\s+/g, ' ').replace(/\s*\(sugerowan[ya]\)$/i, '').trim();
+    if (!name || !value || name.length > 60 || NOT_PARAMETER.test(name) || PLACEHOLDER_VALUE.test(value) || seen.has(name.toLowerCase())) continue;
     seen.add(name.toLowerCase());
     out.push({ name, value });
   }

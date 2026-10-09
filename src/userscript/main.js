@@ -127,7 +127,10 @@ function findTitleInput() {
 }
 
 // Pola formularza, które nie są parametrami produktu.
-const NOT_PARAMETER = /tytu[łl]|opis|cen[ay]|price|ilo[śs][ćc]|liczba sztuk|sygnatura|sku|\bean\b|gtin|kod|koszt|wysy[łl]k|dostaw|cennik|faktur|vat|termin|zwrot|reklamac|gwarancj|promowan|waluta|czas trwania/i;
+// „Liczba sztuk” bez dopisku to stan magazynowy oferty, a nie liczba sztuk w zestawie.
+const NOT_PARAMETER = /tytu[łl]|opis|cen[ay]|price|ilo[śs][ćc]|liczba sztuk(?! w (zestawie|opakowaniu|komplecie))|sygnatura|sku|\bean\b|gtin|kod|koszt|wysy[łl]k|dostaw|cennik|faktur|vat|termin|zwrot|reklamac|gwarancj|promowan|waluta|czas trwania|wybierz|\bdata\b|producent|bezpiecze[ńn]st|odpowiedzialn/i;
+// Podpowiedzi pól zamiast wartości („Wybierz…”, „ustaw tekst”).
+const PLACEHOLDER_VALUE = /^(wybierz|ustaw)\b/i;
 
 function fieldLabel(el) {
   const own = labelText(el) || el.getAttribute('aria-label') || '';
@@ -144,8 +147,8 @@ function readFormParameters() {
   for (const el of visibleFields('input[type="text"], input[type="number"], input:not([type]), select, [role="combobox"]')) {
     const name = fieldLabel(el).replace(/\s+/g, ' ').replace(/[*:]\s*$/, '').trim();
     let value = el.tagName === 'SELECT' ? (el.selectedOptions[0] || {}).textContent : el.value ?? el.textContent;
-    value = String(value || '').replace(/\s+/g, ' ').trim();
-    if (!name || !value || name.length > 60 || NOT_PARAMETER.test(name) || /^wybierz/i.test(value) || seen.has(name.toLowerCase())) continue;
+    value = String(value || '').replace(/\s+/g, ' ').replace(/\s*\(sugerowan[ya]\)$/i, '').trim();
+    if (!name || !value || name.length > 60 || NOT_PARAMETER.test(name) || PLACEHOLDER_VALUE.test(value) || seen.has(name.toLowerCase())) continue;
     seen.add(name.toLowerCase());
     out.push({ name, value });
   }

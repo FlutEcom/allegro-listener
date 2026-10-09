@@ -199,8 +199,15 @@ aktywna w sezonie prezentowym.
 
 ### SEKCJA 6 – ⚙️ S P E C Y F I K A C J A
 
-- Parametry `**Nazwa:** wartość`. Pierwszeństwo mają parametry z formularza
-  lub od sprzedawcy. Gemini może je uzupełnić **tylko** faktami z danych.
+- **Tylko trzy wiersze**, zawsze w tej kolejności – nic więcej (bez marki,
+  stanu, rodzaju, danych producenta itp.):
+  - `**Wymiary:**` – z pola „Wymiary”/„Rozmiar” albo złożone z pól „Długość”,
+    „Szerokość”, „Wysokość” (`10 cm × 5 cm × 2 cm`),
+  - `**Liczba sztuk:**` – ile sztuk/elementów w opakowaniu,
+  - `**Wiek dziecka:**` – z pola „Wiek dziecka”, a gdy go brak – z „Minimalny
+    wiek dziecka” (`3` → `od 3 lat`).
+- Pierwszeństwo mają parametry z formularza. Gemini może uzupełnić brakujący
+  wiersz **tylko** faktami z danych; wiersz, którego nikt nie zna, jest pomijany.
 - Jeśli produkt ma małe elementy (`smallParts: true`), wtyczka dodaje
   ostrzeżenie:
   `❗ Nieodpowiednie dla dzieci w wieku poniżej 36 miesięcy. Zawiera małe elementy.`

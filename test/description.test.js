@@ -61,13 +61,35 @@ test('szablon: H1 = tytuł, stałe nagłówki, specyfikacja, Q&A na końcu', () 
   assert.equal(sections[4].blocks[0].text, '❄️ GOTOWY PREZENT POD CHOINKĘ');
   const spec = sections[5].blocks.map((b) => b.text);
   assert.equal(spec[0], '⚙️ S P E C Y F I K A C J A');
-  assert.ok(spec.includes('**Wiek dziecka:** 6 lat +')); // parametr sprzedawcy wygrywa z Gemini
-  assert.ok(!spec.includes('**Wiek dziecka:** 5 lat'));
-  assert.ok(spec.includes('**Liczba elementów:** 500'));
-  assert.ok(spec.some((t) => t.includes('poniżej 36 miesięcy')));
+  // tylko liczba sztuk i wiek (wymiarów brak w danych); parametr sprzedawcy wygrywa z Gemini
+  assert.deepEqual(spec.slice(1, 3), ['**Liczba sztuk:** 500', '**Wiek dziecka:** 6 lat +']);
+  assert.ok(spec[3].includes('poniżej 36 miesięcy'));
   assert.equal(spec.at(-1), '✅ Produkt nowy, nieużywany, fabrycznie zapakowany.');
   assert.equal(sections[6].layout, 'TEXT');
   assert.equal(sections[6].blocks.at(-1).text, '❤️ Dziękujemy, że wybierasz nasze zabawki.');
+});
+
+test('specyfikacja: tylko wymiary, liczba sztuk i wiek dziecka', () => {
+  const form = [
+    { name: 'Stan', value: 'Nowy' },
+    { name: 'Rodzaj', value: 'kostki antystresowe' },
+    { name: 'Minimalny wiek dziecka (opcjonalnie)', value: '3' },
+    { name: 'Marka', value: 'Schylling Inc.' },
+    { name: 'Wymiary', value: '6,5 cm x 4 cm x 4 cm' },
+    { name: 'Informacje o bezpieczeństwie', value: 'ustaw tekst' },
+  ];
+  const gemini = [{ name: 'Liczba sztuk', value: '4' }, { name: 'Materiał', value: 'silikon' }];
+  assert.deepEqual(D.pickSpec([form, gemini]), [
+    { name: 'Wymiary', value: '6,5 cm x 4 cm x 4 cm' },
+    { name: 'Liczba sztuk', value: '4' },
+    { name: 'Wiek dziecka', value: 'od 3 lat' }, // „Minimalny wiek” – gdy brak „Wiek dziecka”
+  ]);
+  // „Wiek dziecka” ma pierwszeństwo przed minimalnym wiekiem
+  assert.deepEqual(D.pickSpec([[...form, { name: 'Wiek dziecka', value: '3 lata +' }]]).at(-1), { name: 'Wiek dziecka', value: '3 lata +' });
+  // wymiary składane z osobnych pól, wiek z rozpoznania Gemini
+  const parts = [{ name: 'Długość', value: '10 cm' }, { name: 'Szerokość', value: '5 cm' }, { name: 'Wysokość', value: '2 cm' }];
+  assert.deepEqual(D.pickSpec([parts], '6+'), [{ name: 'Wymiary', value: '10 cm × 5 cm × 2 cm' }, { name: 'Wiek dziecka', value: '6+' }]);
+  assert.deepEqual(D.pickSpec([undefined, []]), []);
 });
 
 test('separator: domyślnie brak, można włączyć', () => {

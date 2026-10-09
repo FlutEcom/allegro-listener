@@ -66,7 +66,8 @@ test('tryb katalogu: parametry z formularza w prompcie i w specyfikacji', async 
   assert.match(calls[0].prompt, /PRODUKT Z KATALOGU/);
   assert.match(calls[0].prompt, /Parametry z katalogu:\n1\. Marka: Magnetico/);
   const spec = r.description.description.sections.find((s) => s.id === 'spec').blocks.map((b) => b.text);
-  assert.ok(spec.includes('**Marka:** Magnetico'));
+  assert.ok(spec.includes('**Wiek dziecka:** 3 lata +'));
+  assert.ok(!spec.some((t) => t.includes('Magnetico'))); // marka nie trafia do specyfikacji
 });
 
 test('wyszukiwarka wyłączona w ustawieniach', async () => {
