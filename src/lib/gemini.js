@@ -145,6 +145,7 @@
 
   return {
     API_BASE,
+    extractJson,
     buildGenerateRequest,
     buildListModelsRequest,
     parseGenerateResponse,

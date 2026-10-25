@@ -1,6 +1,8 @@
 /**
  * Szybkie wystawianie: jedno zapytanie do Gemini (zdjęcia + nazwa + wyszukiwarka Google)
  * rozpoznaje produkt, znajduje słowa kluczowe i styl konkurencji, pisze tytuł i opis.
+ * Gdy podano osobnego autora opisu (Claude), Gemini robi tylko produkt, frazy i tytuł,
+ * a opis pisze Claude na podstawie gotowego tytułu, fraz i zdjęć.
  * Potem walidacja wg rules/ i – tylko gdy trzeba – krótkie zapytania naprawcze (bez zdjęć i wyszukiwania).
  *
  * Tryby:
@@ -22,7 +24,7 @@
   const S = { type: 'STRING' };
   const LIST = { type: 'ARRAY', items: S };
 
-  const LISTING_SCHEMA = {
+  const RESEARCH_SCHEMA = {
     type: 'OBJECT',
     properties: {
       product: {
@@ -36,10 +38,18 @@
       competitorTitles: LIST,
       caseStyle: { type: 'STRING', enum: ['UPPER', 'TITLE'] },
       titles: LIST,
-      description: D.DESCRIPTION_SCHEMA,
     },
-    required: ['product', 'keywords', 'caseStyle', 'titles', 'description'],
+    required: ['product', 'keywords', 'caseStyle', 'titles'],
   };
+
+  const LISTING_SCHEMA = {
+    ...RESEARCH_SCHEMA,
+    properties: { ...RESEARCH_SCHEMA.properties, description: D.DESCRIPTION_SCHEMA },
+    required: [...RESEARCH_SCHEMA.required, 'description'],
+  };
+
+  const RESEARCH_JSON = '"product":{"name":"","brand":"","age":"","features":[""],"benefits":[""],"contents":[""],"smallParts":false},"keywords":[""],"competitorTitles":[""],"caseStyle":"UPPER","titles":[""]';
+  const DESCRIPTION_JSON = '"description":{"hook":{"headline":"","benefit":"","cta":""},"topBenefits":[""],"gains":[{"feature":"","benefit":"","emotion":""}],"play":{"heading":"","paragraphs":[""]},"glossary":[{"term":"","explanation":""}],"contents":{"heading":"","items":[""],"sizeNote":""},"gift":{"heading":"","paragraph":""},"spec":[{"name":"","value":""}],"faq":[{"q":"","a":""}],"closing":""}';
 
   function list(items) {
     return (items || []).filter(Boolean).map((x, i) => `${i + 1}. ${x}`).join('\n') || '(brak)';
@@ -56,17 +66,26 @@
    * @param {{
    *   mode: 'NEW'|'CATALOG', productName?: string, extra?: string, parameters?: Array<{name: string, value: string}>,
    *   imageCount?: number, search?: boolean, caseStyle?: 'AUTO'|'UPPER'|'TITLE',
-   *   socialProof?: string, promo?: string, date?: Date|string
-   * }} input
+   *   socialProof?: string, promo?: string, date?: Date|string, withDescription?: boolean
+   * }} input  withDescription: false – bez opisu (pisze go osobny model)
    */
   function buildListingPrompt(input) {
     const catalog = input.mode === 'CATALOG';
+    const withDescription = input.withDescription !== false;
     const budget = D.hookBudget({ title: 'X'.repeat(T.TITLE_MAX), socialProof: input.socialProof });
     const params = (input.parameters || []).map((p) => `${p.name}: ${p.value}`);
     const research = input.search === false
       ? 'Nie masz dostępu do wyszukiwarki – dobierz frazy, którymi Polacy najczęściej szukają takiego produktu na Allegro, na podstawie swojej wiedzy.'
       : 'Użyj wyszukiwarki Google: sprawdź Google Trends, podpowiedzi wyszukiwania i oferty na allegro.pl. Znajdź frazy, którymi Polacy najczęściej szukają tego produktu.';
-    return `Jesteś ekspertem od sprzedaży zabawek na Allegro: SEO i copywriting. Przygotuj kompletną ofertę.
+    const descriptionStep = withDescription
+      ? `KROK 4 – OPIS ("description"):
+${D.RULES_TEXT}
+LIMIT HOOKA: headline + benefit + cta razem max ${budget} znaków.
+Okazje prezentowe: ${D.occasionsFor(input.date).occasions.join(', ')}
+
+`
+      : '';
+    return `Jesteś ekspertem od sprzedaży zabawek na Allegro: SEO i copywriting. ${withDescription ? 'Przygotuj kompletną ofertę.' : 'Przygotuj dane produktu, słowa kluczowe i tytuł oferty (opis napisze ktoś inny).'}
 
 TRYB: ${catalog
     ? 'PRODUKT Z KATALOGU ALLEGRO – nazwa i parametry poniżej pochodzą z katalogu i są prawdziwe. Opieraj się na nich.'
@@ -85,16 +104,11 @@ KROK 3 – TYTUŁ ("titles"): 5 różnych propozycji. Każda zaczyna się od pie
 ${T.RULES_TEXT.replace('{{CASE_RULE}}', caseRule(input))}
 Policz znaki każdego tytułu przed odpowiedzią.
 
-KROK 4 – OPIS ("description"):
-${D.RULES_TEXT}
-LIMIT HOOKA: headline + benefit + cta razem max ${budget} znaków.
-Okazje prezentowe: ${D.occasionsFor(input.date).occasions.join(', ')}
-
-DANE OD SPRZEDAWCY:
+${descriptionStep}DANE OD SPRZEDAWCY:
 Nazwa: ${input.productName || '(brak – rozpoznaj ze zdjęć)'}
 ${params.length ? `Parametry${catalog ? ' z katalogu' : ''}:\n${list(params)}\n` : ''}${input.socialProof ? `Social proof (wtyczka wstawi go sama): ${input.socialProof}\n` : ''}${input.extra ? `Dodatkowe informacje:\n${input.extra}\n` : ''}
 Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
-{"product":{"name":"","brand":"","age":"","features":[""],"benefits":[""],"contents":[""],"smallParts":false},"keywords":[""],"competitorTitles":[""],"caseStyle":"UPPER","titles":[""],"description":{"hook":{"headline":"","benefit":"","cta":""},"topBenefits":[""],"gains":[{"feature":"","benefit":"","emotion":""}],"play":{"heading":"","paragraphs":[""]},"glossary":[{"term":"","explanation":""}],"contents":{"heading":"","items":[""],"sizeNote":""},"gift":{"heading":"","paragraph":""},"spec":[{"name":"","value":""}],"faq":[{"q":"","a":""}],"closing":""}}`;
+{${RESEARCH_JSON}${withDescription ? `,${DESCRIPTION_JSON}` : ''}}`;
   }
 
   function strings(arr) {
@@ -164,18 +178,39 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
   }
 
   /**
+   * Opis: osobny autor (Claude), a gdy zawiedzie – Gemini. Zwraca {content, engine, engineError}.
+   */
+  async function writeDescription(descInput, images, ask, describe, progress) {
+    const prompt = D.buildDescriptionPrompt(descInput);
+    try {
+      progress(`${describe.label || 'Claude'} pisze opis…`);
+      return { content: await describe(prompt, D.DESCRIPTION_SCHEMA, { images }), engine: 'describe', engineError: null };
+    } catch (e) {
+      progress(`${describe.label || 'Claude'} nie odpowiedział – opis pisze Gemini…`);
+      return { content: await ask(prompt, D.DESCRIPTION_SCHEMA, { images }), engine: 'gemini', engineError: e.message };
+    }
+  }
+
+  /**
    * @param {object} input  patrz buildListingPrompt + images: [{mimeType, data}]
    * @param {Function} ask  ask(prompt, schema, {images, search}) z gemini.createAsk
-   * @param {{maxRepairs?: number, onProgress?: (msg: string) => void}} [opts]
+   * @param {{maxRepairs?: number, onProgress?: (msg: string) => void, describe?: Function}} [opts]
+   *   describe – osobny autor opisu: ask(prompt, schema, {images}) z claude.createAsk; describe.label – nazwa w komunikatach
    */
   async function generateListing(input, ask, opts) {
     opts = opts || {};
     const maxRepairs = opts.maxRepairs ?? MAX_REPAIRS;
     const progress = opts.onProgress || (() => {});
     const images = input.images || [];
+    const describe = opts.describe;
 
-    progress(input.search === false ? 'Gemini analizuje produkt i pisze ofertę…' : 'Gemini analizuje produkt, szuka słów kluczowych i pisze ofertę…');
-    const first = await ask(buildListingPrompt({ ...input, imageCount: images.length }), LISTING_SCHEMA, { images, search: input.search !== false });
+    const what = describe ? 'pisze tytuł' : 'pisze ofertę';
+    progress(input.search === false ? `Gemini analizuje produkt i ${what}…` : `Gemini analizuje produkt, szuka słów kluczowych i ${what}…`);
+    const first = await ask(
+      buildListingPrompt({ ...input, imageCount: images.length, withDescription: !describe }),
+      describe ? RESEARCH_SCHEMA : LISTING_SCHEMA,
+      { images, search: input.search !== false },
+    );
     const { product, research, titleInput, descInput } = buildRuleInputs(input, first);
 
     // Tytuł
@@ -196,13 +231,23 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
 
     // Opis
     descInput.title = title;
-    let content = (first && first.description) || {};
+    const written = describe
+      ? await writeDescription(descInput, images, ask, describe, progress)
+      : { content: first && first.description, engine: 'gemini', engineError: null };
+    const repairAsk = written.engine === 'describe' ? describe : ask;
+    let content = written.content || {};
     let desc = D.validateDescription(content, descInput);
     let descAttempts = 1;
     while (!desc.ok && title && descAttempts <= maxRepairs) {
       descAttempts++;
       progress(`Poprawiam opis (próba ${descAttempts})…`);
-      content = await ask(D.buildDescriptionRepairPrompt(descInput, content, desc.errors), D.DESCRIPTION_SCHEMA);
+      try {
+        content = await repairAsk(D.buildDescriptionRepairPrompt(descInput, content, desc.errors), D.DESCRIPTION_SCHEMA);
+      } catch (e) {
+        if (written.engine !== 'describe') throw e;
+        written.engineError = e.message; // zostaje ostatni opis z uwagami walidatora – tytuł nie przepada
+        break;
+      }
       desc = D.validateDescription(content, descInput);
     }
 
@@ -210,11 +255,11 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
       product,
       research,
       title: { value: title, ok: !!picked.best, results: titleResults, attempts: titleAttempts },
-      description: { ...desc, content, attempts: descAttempts },
+      description: { ...desc, content, attempts: descAttempts, engine: written.engine, engineError: written.engineError },
       descInput,
       titleInput,
     };
   }
 
-  return { MAX_REPAIRS, LISTING_SCHEMA, buildListingPrompt, buildRuleInputs, generateListing };
+  return { MAX_REPAIRS, RESEARCH_SCHEMA, LISTING_SCHEMA, buildListingPrompt, buildRuleInputs, generateListing };
 });

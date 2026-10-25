@@ -1,14 +1,16 @@
 // ==UserScript==
 // @name         Allegro Listener – AI tytuł i opis
 // @namespace    https://github.com/FlutEcom/allegro-listener
-// @version      0.3.1
-// @description  Błyskawiczne wystawianie ofert: zdjęcie + nazwa → Gemini pisze tytuł i opis wg reguł z rules/
+// @version      0.4.0
+// @description  Błyskawiczne wystawianie ofert: zdjęcie + nazwa → Gemini pisze tytuł, Claude Opus opis wg reguł z rules/
 // @match        https://salescenter.allegro.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @connect      generativelanguage.googleapis.com
+// @connect      api.anthropic.com
+// @connect      *
 // @connect      allegroimg.com
 // @run-at       document-idle
 // @noframes
@@ -1120,10 +1122,199 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
 
   return {
     API_BASE,
+    extractJson,
     buildGenerateRequest,
     buildListModelsRequest,
     parseGenerateResponse,
     parseSearchQueries,
+    parseListModelsResponse,
+    createAsk,
+    listModels,
+  };
+});
+
+})(NS, undefined);
+
+// ----- src/lib/claude.js -----
+(function (self, module) {
+/**
+ * Klient Claude (Messages API) do pisania opisu – bezpośrednio do api.anthropic.com albo przez bramkę (proxy)
+ * zgodną z formatem Anthropic. Transport jak w gemini.js: w Tampermonkey GM_xmlhttpRequest, w testach atrapa.
+ *
+ * transport(request) → Promise<{status: number, text: string}>
+ * request = {method, url, headers, body?}
+ */
+(function (root, factory) {
+  const cjs = typeof module === 'object' && module.exports;
+  const api = factory(cjs ? require('./gemini.js') : root.AllegroGemini);
+  if (cjs) module.exports = api;
+  else root.AllegroClaude = api;
+})(typeof self !== 'undefined' ? self : this, function (G) {
+  'use strict';
+
+  const DEFAULT_BASE_URL = 'https://api.anthropic.com';
+  const DEFAULT_MODEL = 'claude-opus-5-5';
+  const DEFAULT_EFFORT = 'medium';
+  const API_VERSION = '2026-10-21';
+  const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+  const MAX_TOKENS = 16000;
+  // Modele, które przyjmują fallbacks: "default" (ponowienie odrzuconego zapytania na innym modelu).
+  const FALLBACK_MODELS = /claude-(fable-5|opus-5|sonnet-5-5)/;
+
+  /** Adres bramki → endpoint Messages: „https://x”, „https://x/v1” i „https://x/v1/messages” są równoważne. */
+  function messagesUrl(baseUrl) {
+    const base = String(baseUrl || '').trim().replace(/\/+$/, '') || DEFAULT_BASE_URL;
+    if (/\/messages$/.test(base)) return base;
+    return /\/v1$/.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+  }
+
+  function modelsUrl(baseUrl) {
+    return messagesUrl(baseUrl).replace(/\/messages$/, '/models');
+  }
+
+  /** auth: 'X_API_KEY' (Anthropic) albo 'BEARER' (Authorization: Bearer – część bramek); 'AUTO' zaczyna od x-api-key. */
+  function authHeaders(apiKey, auth) {
+    return auth === 'BEARER' ? { Authorization: `Bearer ${apiKey}` } : { 'x-api-key': apiKey };
+  }
+
+  /** Schemat w stylu Gemini (type: 'OBJECT'…) → JSON Schema dla structured outputs (obiekty z additionalProperties: false). */
+  function toJsonSchema(s) {
+    const out = {};
+    if (s.type) out.type = String(s.type).toLowerCase();
+    if (s.enum) out.enum = s.enum;
+    if (s.items) out.items = toJsonSchema(s.items);
+    if (s.properties) {
+      out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, v]) => [k, toJsonSchema(v)]));
+      out.required = s.required || [];
+      out.additionalProperties = false;
+    }
+    return out;
+  }
+
+  /**
+   * @param {{apiKey: string, model: string, baseUrl?: string, auth?: string, prompt: string, schema?: object,
+   *   images?: Array<{mimeType: string, data: string}>, effort?: string, plain?: boolean}} p
+   *   plain: true – samo model + wiadomość (zapasowo, gdy bramka nie zna myślenia, effort, schematu albo fallbacks)
+   */
+  function buildMessagesRequest({ apiKey, model, baseUrl, auth, prompt, schema, images, effort, plain }) {
+    const content = [
+      ...(images || []).map((img) => ({ type: 'image', source: { type: 'base64', media_type: img.mimeType, data: img.data } })),
+      { type: 'text', text: prompt },
+    ];
+    const body = { model, max_tokens: MAX_TOKENS, messages: [{ role: 'user', content }] };
+    const headers = { 'Content-Type': 'application/json', 'anthropic-version': API_VERSION, ...authHeaders(apiKey, auth) };
+    if (!plain) {
+      body.thinking = { type: 'adaptive' };
+      body.output_config = { effort: effort || DEFAULT_EFFORT };
+      if (schema) body.output_config.format = { type: 'json_schema', schema: toJsonSchema(schema) };
+      if (FALLBACK_MODELS.test(model)) {
+        body.fallbacks = 'default';
+        headers['anthropic-beta'] = FALLBACK_BETA;
+      }
+    }
+    return { method: 'POST', url: messagesUrl(baseUrl), headers, body: JSON.stringify(body) };
+  }
+
+  function buildListModelsRequest({ apiKey, baseUrl, auth }) {
+    return { method: 'GET', url: `${modelsUrl(baseUrl)}?limit=1000`, headers: { 'anthropic-version': API_VERSION, ...authHeaders(apiKey, auth) } };
+  }
+
+  function safeJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Czytelny komunikat błędu HTTP z podpowiedzią, co poprawić. */
+  function httpError(status, text) {
+    const body = safeJson(text);
+    const msg = (body && body.error && (body.error.message || body.error)) || String(text || '').slice(0, 200);
+    let hint = '';
+    if (status === 401 || status === 403) hint = 'Klucz API jest nieprawidłowy albo bramka chce innego nagłówka – zmień „Logowanie do bramki” w ustawieniach.';
+    else if (status === 404) hint = 'Sprawdź adres bramki i nazwę modelu (przycisk „Pobierz modele Claude”).';
+    else if (status === 429) hint = 'Przekroczony limit zapytań – odczekaj chwilę.';
+    else if (status === 529 || status === 503) hint = 'Claude jest teraz przeciążony – spróbuj za chwilę.';
+    else if (status >= 500) hint = 'Błąd po stronie bramki albo Anthropic – spróbuj ponownie.';
+    const err = new Error(`Claude ${status}: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}${hint ? ' ' + hint : ''}`);
+    err.status = status;
+    return err;
+  }
+
+  /** Wyciąga JSON z odpowiedzi Messages API (bloki text; bloki thinking są pomijane). */
+  function parseMessagesResponse(status, text) {
+    if (status < 200 || status >= 300) throw httpError(status, text);
+    const body = safeJson(text);
+    if (!body) throw new Error('Claude: odpowiedź bramki nie jest JSON-em – sprawdź adres bramki.');
+    if (body.type === 'error') throw httpError(status, text);
+    if (body.stop_reason === 'refusal') {
+      const details = body.stop_details && body.stop_details.category;
+      throw new Error(`Claude odmówił odpowiedzi${details ? ` (${details})` : ''}.`);
+    }
+    const out = (body.content || []).filter((b) => b.type === 'text').map((b) => b.text || '').join('').trim();
+    if (!out) throw new Error(`Claude: pusta odpowiedź${body.stop_reason ? ` (${body.stop_reason})` : ''}`);
+    const json = G.extractJson(out);
+    if (!json) {
+      throw new Error(body.stop_reason === 'max_tokens' ? 'Claude: odpowiedź ucięta (max_tokens)' : 'Claude: odpowiedź nie jest poprawnym JSON-em');
+    }
+    return json;
+  }
+
+  /** Lista identyfikatorów modeli z GET /v1/models, np. ['claude-opus-5-5', …]. */
+  function parseListModelsResponse(status, text) {
+    if (status < 200 || status >= 300) throw httpError(status, text);
+    const body = safeJson(text) || {};
+    return (body.data || []).map((m) => m.id).filter(Boolean).sort();
+  }
+
+  const isAuthError = (res) => res.status === 401 || res.status === 403;
+
+  /**
+   * Zwraca funkcję ask(prompt, schema, {images}) → Promise<object>, zgodną z gemini.createAsk.
+   * auth 'AUTO': przy 401/403 ponawia z Authorization: Bearer i zapamiętuje, który nagłówek działa.
+   * 400: ponawia raz w trybie plain (bramka może nie znać nowszych parametrów).
+   * @param {{apiKey: string, model: string, baseUrl?: string, auth?: string, effort?: string, transport: Function,
+   *   onAuth?: (auth: string) => void}} cfg
+   */
+  function createAsk(cfg) {
+    let auth = cfg.auth || 'AUTO';
+    return async function ask(prompt, schema, opts) {
+      opts = opts || {};
+      if (!cfg.apiKey) throw new Error('Brak klucza API Claude – uzupełnij go w ustawieniach.');
+      if (!cfg.model) throw new Error('Brak nazwy modelu Claude – uzupełnij ją w ustawieniach.');
+      const send = (plain, a) => cfg.transport(buildMessagesRequest({ ...cfg, auth: a, prompt, schema, images: opts.images, plain }));
+      let res = await send(false, auth);
+      if (isAuthError(res) && auth === 'AUTO') {
+        const bearer = await send(false, 'BEARER');
+        if (!isAuthError(bearer)) {
+          auth = 'BEARER';
+          res = bearer;
+          if (cfg.onAuth) cfg.onAuth(auth);
+        }
+      }
+      if (res.status === 400) res = await send(true, auth);
+      return parseMessagesResponse(res.status, res.text);
+    };
+  }
+
+  async function listModels(cfg) {
+    if (!cfg.apiKey) throw new Error('Brak klucza API Claude – uzupełnij go w ustawieniach.');
+    let res = await cfg.transport(buildListModelsRequest(cfg));
+    if (isAuthError(res) && (cfg.auth || 'AUTO') === 'AUTO') res = await cfg.transport(buildListModelsRequest({ ...cfg, auth: 'BEARER' }));
+    return parseListModelsResponse(res.status, res.text);
+  }
+
+  return {
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DEFAULT_EFFORT,
+    API_VERSION,
+    messagesUrl,
+    toJsonSchema,
+    buildMessagesRequest,
+    buildListModelsRequest,
+    parseMessagesResponse,
     parseListModelsResponse,
     createAsk,
     listModels,
@@ -1137,6 +1328,8 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
 /**
  * Szybkie wystawianie: jedno zapytanie do Gemini (zdjęcia + nazwa + wyszukiwarka Google)
  * rozpoznaje produkt, znajduje słowa kluczowe i styl konkurencji, pisze tytuł i opis.
+ * Gdy podano osobnego autora opisu (Claude), Gemini robi tylko produkt, frazy i tytuł,
+ * a opis pisze Claude na podstawie gotowego tytułu, fraz i zdjęć.
  * Potem walidacja wg rules/ i – tylko gdy trzeba – krótkie zapytania naprawcze (bez zdjęć i wyszukiwania).
  *
  * Tryby:
@@ -1158,7 +1351,7 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
   const S = { type: 'STRING' };
   const LIST = { type: 'ARRAY', items: S };
 
-  const LISTING_SCHEMA = {
+  const RESEARCH_SCHEMA = {
     type: 'OBJECT',
     properties: {
       product: {
@@ -1172,10 +1365,18 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
       competitorTitles: LIST,
       caseStyle: { type: 'STRING', enum: ['UPPER', 'TITLE'] },
       titles: LIST,
-      description: D.DESCRIPTION_SCHEMA,
     },
-    required: ['product', 'keywords', 'caseStyle', 'titles', 'description'],
+    required: ['product', 'keywords', 'caseStyle', 'titles'],
   };
+
+  const LISTING_SCHEMA = {
+    ...RESEARCH_SCHEMA,
+    properties: { ...RESEARCH_SCHEMA.properties, description: D.DESCRIPTION_SCHEMA },
+    required: [...RESEARCH_SCHEMA.required, 'description'],
+  };
+
+  const RESEARCH_JSON = '"product":{"name":"","brand":"","age":"","features":[""],"benefits":[""],"contents":[""],"smallParts":false},"keywords":[""],"competitorTitles":[""],"caseStyle":"UPPER","titles":[""]';
+  const DESCRIPTION_JSON = '"description":{"hook":{"headline":"","benefit":"","cta":""},"topBenefits":[""],"gains":[{"feature":"","benefit":"","emotion":""}],"play":{"heading":"","paragraphs":[""]},"glossary":[{"term":"","explanation":""}],"contents":{"heading":"","items":[""],"sizeNote":""},"gift":{"heading":"","paragraph":""},"spec":[{"name":"","value":""}],"faq":[{"q":"","a":""}],"closing":""}';
 
   function list(items) {
     return (items || []).filter(Boolean).map((x, i) => `${i + 1}. ${x}`).join('\n') || '(brak)';
@@ -1192,17 +1393,26 @@ Popraw te błędy i zwróć cały JSON ponownie.`;
    * @param {{
    *   mode: 'NEW'|'CATALOG', productName?: string, extra?: string, parameters?: Array<{name: string, value: string}>,
    *   imageCount?: number, search?: boolean, caseStyle?: 'AUTO'|'UPPER'|'TITLE',
-   *   socialProof?: string, promo?: string, date?: Date|string
-   * }} input
+   *   socialProof?: string, promo?: string, date?: Date|string, withDescription?: boolean
+   * }} input  withDescription: false – bez opisu (pisze go osobny model)
    */
   function buildListingPrompt(input) {
     const catalog = input.mode === 'CATALOG';
+    const withDescription = input.withDescription !== false;
     const budget = D.hookBudget({ title: 'X'.repeat(T.TITLE_MAX), socialProof: input.socialProof });
     const params = (input.parameters || []).map((p) => `${p.name}: ${p.value}`);
     const research = input.search === false
       ? 'Nie masz dostępu do wyszukiwarki – dobierz frazy, którymi Polacy najczęściej szukają takiego produktu na Allegro, na podstawie swojej wiedzy.'
       : 'Użyj wyszukiwarki Google: sprawdź Google Trends, podpowiedzi wyszukiwania i oferty na allegro.pl. Znajdź frazy, którymi Polacy najczęściej szukają tego produktu.';
-    return `Jesteś ekspertem od sprzedaży zabawek na Allegro: SEO i copywriting. Przygotuj kompletną ofertę.
+    const descriptionStep = withDescription
+      ? `KROK 4 – OPIS ("description"):
+${D.RULES_TEXT}
+LIMIT HOOKA: headline + benefit + cta razem max ${budget} znaków.
+Okazje prezentowe: ${D.occasionsFor(input.date).occasions.join(', ')}
+
+`
+      : '';
+    return `Jesteś ekspertem od sprzedaży zabawek na Allegro: SEO i copywriting. ${withDescription ? 'Przygotuj kompletną ofertę.' : 'Przygotuj dane produktu, słowa kluczowe i tytuł oferty (opis napisze ktoś inny).'}
 
 TRYB: ${catalog
     ? 'PRODUKT Z KATALOGU ALLEGRO – nazwa i parametry poniżej pochodzą z katalogu i są prawdziwe. Opieraj się na nich.'
@@ -1221,16 +1431,11 @@ KROK 3 – TYTUŁ ("titles"): 5 różnych propozycji. Każda zaczyna się od pie
 ${T.RULES_TEXT.replace('{{CASE_RULE}}', caseRule(input))}
 Policz znaki każdego tytułu przed odpowiedzią.
 
-KROK 4 – OPIS ("description"):
-${D.RULES_TEXT}
-LIMIT HOOKA: headline + benefit + cta razem max ${budget} znaków.
-Okazje prezentowe: ${D.occasionsFor(input.date).occasions.join(', ')}
-
-DANE OD SPRZEDAWCY:
+${descriptionStep}DANE OD SPRZEDAWCY:
 Nazwa: ${input.productName || '(brak – rozpoznaj ze zdjęć)'}
 ${params.length ? `Parametry${catalog ? ' z katalogu' : ''}:\n${list(params)}\n` : ''}${input.socialProof ? `Social proof (wtyczka wstawi go sama): ${input.socialProof}\n` : ''}${input.extra ? `Dodatkowe informacje:\n${input.extra}\n` : ''}
 Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
-{"product":{"name":"","brand":"","age":"","features":[""],"benefits":[""],"contents":[""],"smallParts":false},"keywords":[""],"competitorTitles":[""],"caseStyle":"UPPER","titles":[""],"description":{"hook":{"headline":"","benefit":"","cta":""},"topBenefits":[""],"gains":[{"feature":"","benefit":"","emotion":""}],"play":{"heading":"","paragraphs":[""]},"glossary":[{"term":"","explanation":""}],"contents":{"heading":"","items":[""],"sizeNote":""},"gift":{"heading":"","paragraph":""},"spec":[{"name":"","value":""}],"faq":[{"q":"","a":""}],"closing":""}}`;
+{${RESEARCH_JSON}${withDescription ? `,${DESCRIPTION_JSON}` : ''}}`;
   }
 
   function strings(arr) {
@@ -1300,18 +1505,39 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
   }
 
   /**
+   * Opis: osobny autor (Claude), a gdy zawiedzie – Gemini. Zwraca {content, engine, engineError}.
+   */
+  async function writeDescription(descInput, images, ask, describe, progress) {
+    const prompt = D.buildDescriptionPrompt(descInput);
+    try {
+      progress(`${describe.label || 'Claude'} pisze opis…`);
+      return { content: await describe(prompt, D.DESCRIPTION_SCHEMA, { images }), engine: 'describe', engineError: null };
+    } catch (e) {
+      progress(`${describe.label || 'Claude'} nie odpowiedział – opis pisze Gemini…`);
+      return { content: await ask(prompt, D.DESCRIPTION_SCHEMA, { images }), engine: 'gemini', engineError: e.message };
+    }
+  }
+
+  /**
    * @param {object} input  patrz buildListingPrompt + images: [{mimeType, data}]
    * @param {Function} ask  ask(prompt, schema, {images, search}) z gemini.createAsk
-   * @param {{maxRepairs?: number, onProgress?: (msg: string) => void}} [opts]
+   * @param {{maxRepairs?: number, onProgress?: (msg: string) => void, describe?: Function}} [opts]
+   *   describe – osobny autor opisu: ask(prompt, schema, {images}) z claude.createAsk; describe.label – nazwa w komunikatach
    */
   async function generateListing(input, ask, opts) {
     opts = opts || {};
     const maxRepairs = opts.maxRepairs ?? MAX_REPAIRS;
     const progress = opts.onProgress || (() => {});
     const images = input.images || [];
+    const describe = opts.describe;
 
-    progress(input.search === false ? 'Gemini analizuje produkt i pisze ofertę…' : 'Gemini analizuje produkt, szuka słów kluczowych i pisze ofertę…');
-    const first = await ask(buildListingPrompt({ ...input, imageCount: images.length }), LISTING_SCHEMA, { images, search: input.search !== false });
+    const what = describe ? 'pisze tytuł' : 'pisze ofertę';
+    progress(input.search === false ? `Gemini analizuje produkt i ${what}…` : `Gemini analizuje produkt, szuka słów kluczowych i ${what}…`);
+    const first = await ask(
+      buildListingPrompt({ ...input, imageCount: images.length, withDescription: !describe }),
+      describe ? RESEARCH_SCHEMA : LISTING_SCHEMA,
+      { images, search: input.search !== false },
+    );
     const { product, research, titleInput, descInput } = buildRuleInputs(input, first);
 
     // Tytuł
@@ -1332,13 +1558,23 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
 
     // Opis
     descInput.title = title;
-    let content = (first && first.description) || {};
+    const written = describe
+      ? await writeDescription(descInput, images, ask, describe, progress)
+      : { content: first && first.description, engine: 'gemini', engineError: null };
+    const repairAsk = written.engine === 'describe' ? describe : ask;
+    let content = written.content || {};
     let desc = D.validateDescription(content, descInput);
     let descAttempts = 1;
     while (!desc.ok && title && descAttempts <= maxRepairs) {
       descAttempts++;
       progress(`Poprawiam opis (próba ${descAttempts})…`);
-      content = await ask(D.buildDescriptionRepairPrompt(descInput, content, desc.errors), D.DESCRIPTION_SCHEMA);
+      try {
+        content = await repairAsk(D.buildDescriptionRepairPrompt(descInput, content, desc.errors), D.DESCRIPTION_SCHEMA);
+      } catch (e) {
+        if (written.engine !== 'describe') throw e;
+        written.engineError = e.message; // zostaje ostatni opis z uwagami walidatora – tytuł nie przepada
+        break;
+      }
       desc = D.validateDescription(content, descInput);
     }
 
@@ -1346,13 +1582,13 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
       product,
       research,
       title: { value: title, ok: !!picked.best, results: titleResults, attempts: titleAttempts },
-      description: { ...desc, content, attempts: descAttempts },
+      description: { ...desc, content, attempts: descAttempts, engine: written.engine, engineError: written.engineError },
       descInput,
       titleInput,
     };
   }
 
-  return { MAX_REPAIRS, LISTING_SCHEMA, buildListingPrompt, buildRuleInputs, generateListing };
+  return { MAX_REPAIRS, RESEARCH_SCHEMA, LISTING_SCHEMA, buildListingPrompt, buildRuleInputs, generateListing };
 });
 
 })(NS, undefined);
@@ -1361,10 +1597,11 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
 (function (self, module) {
 /**
  * Panel wtyczki na salescenter.allegro.com/offer…
- * Zdjęcie + nazwa (albo dane z katalogu) → jedno kliknięcie → Gemini: słowa kluczowe, tytuł, opis
- * wg reguł z rules/ → wstawienie tytułu do formularza, kopiowanie sekcji opisu.
+ * Zdjęcie + nazwa (albo dane z katalogu) → jedno kliknięcie → Gemini: słowa kluczowe i tytuł,
+ * Claude Opus (przez bramkę, jeśli ustawiony) albo Gemini: opis wg reguł z rules/
+ * → wstawienie tytułu i opisu do formularza.
  *
- * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroListing)
+ * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroClaude, AllegroListing)
  * dostarcza scripts/build.js w obiekcie `self`.
  */
 /* global GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_setClipboard */
@@ -1373,6 +1610,7 @@ Odpowiedz WYŁĄCZNIE poprawnym JSON-em w formacie:
 const T = self.AllegroTitleRules;
 const D = self.AllegroDescriptionRules;
 const G = self.AllegroGemini;
+const C = self.AllegroClaude;
 const L = self.AllegroListing;
 
 const OFFER_PATH = /^\/offer/;
@@ -1387,11 +1625,25 @@ const settings = {
   get model() { return GM_getValue('model', '') || DEFAULT_MODEL; },
   get caseStyle() { return GM_getValue('caseStyle', 'AUTO'); },
   get search() { return GM_getValue('search', true); },
+  get claudeOn() { return GM_getValue('claudeOn', true); },
+  get claudeKey() { return GM_getValue('claudeKey', ''); },
+  get claudeUrl() { return GM_getValue('claudeUrl', ''); },
+  get claudeModel() { return GM_getValue('claudeModel', '') || C.DEFAULT_MODEL; },
+  get claudeAuth() { return GM_getValue('claudeAuth', 'AUTO'); },
+  get claudeEffort() { return GM_getValue('claudeEffort', C.DEFAULT_EFFORT); },
+  /** Opis pisze Claude, gdy jest włączony i ma klucz. */
+  get useClaude() { return this.claudeOn && !!this.claudeKey; },
   save(values) {
     GM_setValue('apiKey', values.apiKey.trim());
     GM_setValue('model', values.model.trim().replace(/^models\//, ''));
     GM_setValue('caseStyle', values.caseStyle);
     GM_setValue('search', values.search);
+    GM_setValue('claudeOn', values.claudeOn);
+    GM_setValue('claudeKey', values.claudeKey.trim());
+    GM_setValue('claudeUrl', values.claudeUrl.trim());
+    GM_setValue('claudeModel', values.claudeModel.trim());
+    GM_setValue('claudeAuth', values.claudeAuth);
+    GM_setValue('claudeEffort', values.claudeEffort);
   },
 };
 
@@ -1409,7 +1661,7 @@ const state = {
 function gm(req) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      timeout: 180000,
+      timeout: 300000,
       ...req,
       onload: resolve,
       onerror: () => reject(new Error(`Brak połączenia: ${new URL(req.url).host}`)),
@@ -1430,6 +1682,26 @@ function ask() {
     transport: gmTransport,
     onSearch: (q) => { state.searchQueries = q; },
   });
+}
+
+/** Autor opisu: Claude przez bramkę (albo api.anthropic.com); undefined = opis pisze Gemini. */
+function claudeAsk(overrides) {
+  const cfg = {
+    apiKey: settings.claudeKey,
+    model: settings.claudeModel,
+    baseUrl: settings.claudeUrl,
+    auth: settings.claudeAuth,
+    effort: settings.claudeEffort,
+    ...overrides,
+  };
+  const fn = C.createAsk({
+    ...cfg,
+    transport: gmTransport,
+    // AUTO wykrył, że bramka chce Authorization: Bearer – zapamiętaj, żeby nie tracić zapytania następnym razem
+    onAuth: (auth) => { if (cfg.auth === 'AUTO' && !overrides) GM_setValue('claudeAuth', auth); },
+  });
+  fn.label = 'Claude';
+  return fn;
 }
 
 // ---------- zdjęcia ----------
@@ -1718,6 +1990,7 @@ textarea { min-height: 54px; resize: vertical; }
 .card { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
 .card.ok { border-color: #2a9d4b; }
 h3 { font-size: 14px; margin: 18px 0 4px; border-top: 1px solid #eee; padding-top: 12px; }
+h3:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { background: #f0f0f0; border-radius: 12px; padding: 2px 8px; }
 .chip.top { background: #ff5a00; color: #fff; }
@@ -1778,7 +2051,8 @@ function buildUi() {
       el('button', { class: 'btn', on: { click: insertTitle } }, 'Wstaw do formularza'),
       el('button', { class: 'btn sec', on: { click: () => copy($('title').value) } }, 'Kopiuj'),
       el('details', {}, el('summary', { id: 'altTitlesSummary' }, 'Inne propozycje'), el('div', { id: 'altTitles' })),
-      el('h3', {}, 'Opis'),
+      el('h3', {}, 'Opis ', el('small', { id: 'descEngine' })),
+      el('div', { class: 'hint', id: 'descEngineError', hidden: true }),
       el('div', { class: 'row' },
         el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'smallParts', on: { change: refreshDescription } }), 'Małe elementy (ostrzeżenie 36 mies.)'),
         el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'isNew', checked: true, on: { change: refreshDescription } }), 'Produkt nowy'),
@@ -1793,6 +2067,7 @@ function buildUi() {
 
   // --- Ustawienia ---
   const settingsTab = el('div', { id: 'tab-settings', hidden: true },
+    el('h3', {}, 'Gemini – produkt, słowa kluczowe i tytuł'),
     el('label', { for: 'apiKey' }, 'Klucz API Gemini ', el('small', {}, '– zapisywany tylko w Tampermonkey na tym komputerze')),
     el('input', { type: 'password', id: 'apiKey', value: settings.apiKey }),
     el('label', { for: 'model' }, 'Model Gemini ', el('small', {}, `– domyślnie ${DEFAULT_MODEL}`)),
@@ -1805,8 +2080,30 @@ function buildUi() {
       el('option', { value: 'TITLE' }, 'Zawsze Pierwsze Litery Wielkie')),
     el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'search', checked: settings.search }),
       'Szukaj słów kluczowych w Google (Trends, Allegro) – dokładniej, ale wolniej'),
-    el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz'),
     el('button', { class: 'btn sec', on: { click: loadModels } }, 'Pobierz listę modeli'),
+    el('h3', {}, 'Claude Opus – opis'),
+    el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'claudeOn', checked: settings.claudeOn }),
+      'Opis pisze Claude (bez klucza Claude opis pisze Gemini)'),
+    el('label', { for: 'claudeKey' }, 'Klucz API Claude / bramki ', el('small', {}, '– zapisywany tylko w Tampermonkey na tym komputerze')),
+    el('input', { type: 'password', id: 'claudeKey', value: settings.claudeKey }),
+    el('label', { for: 'claudeUrl' }, 'Adres bramki ', el('small', {}, `– np. adres bramki vivo; puste = ${C.DEFAULT_BASE_URL}`)),
+    el('input', { type: 'text', id: 'claudeUrl', value: settings.claudeUrl, placeholder: C.DEFAULT_BASE_URL }),
+    el('label', { for: 'claudeModel' }, 'Model Claude ', el('small', {}, `– domyślnie ${C.DEFAULT_MODEL}`)),
+    el('input', { type: 'text', id: 'claudeModel', value: settings.claudeModel, list: 'claudeModelList' }),
+    el('datalist', { id: 'claudeModelList' }),
+    el('label', { for: 'claudeAuth' }, 'Logowanie do bramki'),
+    el('select', { id: 'claudeAuth' },
+      el('option', { value: 'AUTO' }, 'AUTO – wykryj samo'),
+      el('option', { value: 'X_API_KEY' }, 'Nagłówek x-api-key (jak Anthropic)'),
+      el('option', { value: 'BEARER' }, 'Authorization: Bearer')),
+    el('label', { for: 'claudeEffort' }, 'Staranność opisu'),
+    el('select', { id: 'claudeEffort' },
+      el('option', { value: 'low' }, 'Szybko (low)'),
+      el('option', { value: 'medium' }, 'Standard (medium)'),
+      el('option', { value: 'high' }, 'Dokładnie, ale wolniej (high)')),
+    el('button', { class: 'btn sec', on: { click: loadClaudeModels } }, 'Pobierz modele Claude'),
+    el('button', { class: 'btn sec', on: { click: testClaude } }, 'Sprawdź połączenie z Claude'),
+    el('div', {}, el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz')),
     el('button', { class: 'btn sec', on: { click: () => {
       copy(describeDescriptionDom());
       setStatus('settingsStatus', 'Skopiowano budowę edytora opisu (bez treści). Wklej ją w rozmowie z autorem wtyczki.');
@@ -1814,6 +2111,8 @@ function buildUi() {
     el('div', { class: 'status', id: 'settingsStatus' }),
   );
   settingsTab.querySelector('#caseStyle').value = settings.caseStyle;
+  settingsTab.querySelector('#claudeAuth').value = settings.claudeAuth;
+  settingsTab.querySelector('#claudeEffort').value = settings.claudeEffort;
 
   const tabs = { gen: ['Generuj', genTab], settings: ['Ustawienia', settingsTab] };
   const nav = el('nav', {}, ...Object.entries(tabs).map(([key, [label]]) =>
@@ -1972,7 +2271,10 @@ function buildUi() {
         allowWords: $('allowWords').value.split(',').map((s) => s.trim()).filter(Boolean),
         date: new Date(),
       };
-      state.result = await L.generateListing(input, ask(), { onProgress: (m) => { phase = m; tick(); } });
+      state.result = await L.generateListing(input, ask(), {
+        describe: settings.useClaude ? claudeAsk() : undefined,
+        onProgress: (m) => { phase = m; tick(); },
+      });
       renderResult();
       const secs = Math.round((Date.now() - started) / 1000);
       const r = state.result;
@@ -2001,6 +2303,12 @@ function buildUi() {
         el('div', { class: 'muted' }, `${t.length} znaków${t.ok ? ' · ✔ OK' : ''}`),
         el('ul', { class: 'msgs' }, ...t.errors.map((m) => el('li', { class: 'e' }, m))),
         el('button', { class: 'btn small', on: { click: () => { $('title').value = t.title; refreshDescription(); } } }, 'Wybierz'))));
+    const d = r.description;
+    $('descEngine').textContent = d.engine === 'describe' ? `– napisał Claude (${settings.claudeModel})` : '– napisał Gemini';
+    $('descEngineError').hidden = !d.engineError;
+    $('descEngineError').textContent = d.engineError
+      ? (d.engine === 'describe' ? `Claude nie dokończył poprawek: ${d.engineError}` : `Claude nie odpowiedział, więc opis napisał Gemini. Błąd: ${d.engineError}`)
+      : '';
     $('smallParts').checked = !!r.descInput.smallParts;
     $('isNew').checked = r.descInput.condition === 'NEW';
     refreshDescription();
@@ -2073,8 +2381,22 @@ function buildUi() {
   }
 
   // --- ustawienia ---
+  function claudeForm() {
+    return {
+      apiKey: $('claudeKey').value.trim() || settings.claudeKey,
+      model: $('claudeModel').value.trim() || C.DEFAULT_MODEL,
+      baseUrl: $('claudeUrl').value.trim(),
+      auth: $('claudeAuth').value,
+      effort: $('claudeEffort').value,
+    };
+  }
+
   function saveSettings() {
-    settings.save({ apiKey: $('apiKey').value, model: $('model').value, caseStyle: $('caseStyle').value, search: $('search').checked });
+    settings.save({
+      apiKey: $('apiKey').value, model: $('model').value, caseStyle: $('caseStyle').value, search: $('search').checked,
+      claudeOn: $('claudeOn').checked, claudeKey: $('claudeKey').value, claudeUrl: $('claudeUrl').value,
+      claudeModel: $('claudeModel').value, claudeAuth: $('claudeAuth').value, claudeEffort: $('claudeEffort').value,
+    });
     setStatus('settingsStatus', 'Zapisano.');
     if (settings.apiKey) setTimeout(() => showTab('gen'), 600);
   }
@@ -2085,6 +2407,28 @@ function buildUi() {
       const models = await G.listModels({ apiKey: $('apiKey').value.trim() || settings.apiKey, transport: gmTransport });
       $('modelList').replaceChildren(...models.map((m) => el('option', { value: m })));
       setStatus('settingsStatus', `Dostępne modele (${models.length}): kliknij pole „Model” i wybierz. Np. ${models.filter((m) => /flash/.test(m)).slice(-3).join(', ')}`);
+    } catch (e) {
+      setStatus('settingsStatus', e.message, true);
+    }
+  }
+
+  async function loadClaudeModels() {
+    setStatus('settingsStatus', 'Pobieram modele z bramki…');
+    try {
+      const models = await C.listModels({ ...claudeForm(), transport: gmTransport });
+      $('claudeModelList').replaceChildren(...models.map((m) => el('option', { value: m })));
+      setStatus('settingsStatus', `Modele Claude (${models.length}): kliknij pole „Model Claude” i wybierz. Np. ${models.filter((m) => /opus/.test(m)).slice(-3).join(', ')}`);
+    } catch (e) {
+      setStatus('settingsStatus', e.message, true);
+    }
+  }
+
+  async function testClaude() {
+    const cfg = claudeForm();
+    setStatus('settingsStatus', `Sprawdzam połączenie z ${C.messagesUrl(cfg.baseUrl)}…`);
+    try {
+      const res = await claudeAsk(cfg)('Sprawdzenie połączenia. Odpowiedz JSON-em {"ok": true}.', { type: 'OBJECT', properties: { ok: { type: 'BOOLEAN' } }, required: ['ok'] });
+      setStatus('settingsStatus', res && res.ok ? `Claude działa (${cfg.model}). Kliknij Zapisz.` : 'Claude odpowiedział, ale nie tak, jak trzeba – sprawdź model.', !(res && res.ok));
     } catch (e) {
       setStatus('settingsStatus', e.message, true);
     }

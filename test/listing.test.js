@@ -133,3 +133,62 @@ test('prompt: reguły tytułu i opisu, limit hooka, okazje, dane sprzedawcy', ()
   assert.match(p, /"caseStyle":"UPPER"/);
   assert.doesNotMatch(p, /\{\{CASE_RULE\}\}/);
 });
+
+test('opis od Claude: Gemini robi tylko produkt, frazy i tytuł; Claude dostaje gotowy tytuł i zdjęcia', async () => {
+  const gemini = fakeAsk([answer({ description: undefined })]);
+  const claude = fakeAsk([description()]);
+  claude.ask.label = 'Claude';
+  const progress = [];
+  const r = await L.generateListing(NEW, gemini.ask, { describe: claude.ask, onProgress: (m) => progress.push(m) });
+  assert.equal(gemini.calls.length, 1);
+  assert.equal(gemini.calls[0].schema, L.RESEARCH_SCHEMA);
+  assert.equal(L.RESEARCH_SCHEMA.properties.description, undefined);
+  assert.doesNotMatch(gemini.calls[0].prompt, /KROK 4|"description"/);
+  assert.match(gemini.calls[0].prompt, /opis napisze ktoś inny/);
+  assert.equal(claude.calls.length, 1);
+  assert.equal(claude.calls[0].schema, D.DESCRIPTION_SCHEMA);
+  assert.deepEqual(claude.calls[0].opts, { images: IMG });
+  assert.ok(claude.calls[0].prompt.includes(`Tytuł oferty: ${GOOD_TITLE}`));
+  assert.match(claude.calls[0].prompt, /klocki konstrukcyjne/);
+  assert.equal(r.description.ok, true, r.description.errors.join('\n'));
+  assert.equal(r.description.engine, 'describe');
+  assert.equal(r.description.engineError, null);
+  assert.ok(progress.includes('Claude pisze opis…'));
+});
+
+test('opis od Claude: poprawki też robi Claude', async () => {
+  const gemini = fakeAsk([answer({ description: undefined })]);
+  const claude = fakeAsk([description(1), description(3)]);
+  const r = await L.generateListing(NEW, gemini.ask, { describe: claude.ask });
+  assert.equal(gemini.calls.length, 1);
+  assert.equal(claude.calls.length, 2);
+  assert.match(claude.calls[1].prompt, /ZOSTAŁA ODRZUCONA PRZEZ WALIDATOR/);
+  assert.equal(r.description.ok, true);
+  assert.equal(r.description.attempts, 2);
+});
+
+test('Claude nie odpowiada → opis pisze Gemini, błąd zostaje pokazany', async () => {
+  const gemini = fakeAsk([answer({ description: undefined }), description()]);
+  const claude = async () => { throw new Error('Claude 401: invalid x-api-key'); };
+  const r = await L.generateListing(NEW, gemini.ask, { describe: claude });
+  assert.equal(gemini.calls.length, 2);
+  assert.equal(gemini.calls[1].schema, D.DESCRIPTION_SCHEMA);
+  assert.deepEqual(gemini.calls[1].opts, { images: IMG });
+  assert.equal(r.description.engine, 'gemini');
+  assert.match(r.description.engineError, /401/);
+  assert.equal(r.description.ok, true);
+});
+
+test('poprawka Claude się nie udała → zostaje tytuł i ostatni opis z uwagami', async () => {
+  const gemini = fakeAsk([answer({ description: undefined })]);
+  let n = 0;
+  const claude = async () => {
+    if (n++ === 0) return description(1);
+    throw new Error('Claude 529: Overloaded');
+  };
+  const r = await L.generateListing(NEW, gemini.ask, { describe: claude });
+  assert.equal(r.title.value, GOOD_TITLE);
+  assert.equal(r.description.engine, 'describe');
+  assert.equal(r.description.ok, false);
+  assert.match(r.description.engineError, /529/);
+});

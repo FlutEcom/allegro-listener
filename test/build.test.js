@@ -11,5 +11,8 @@ test('userscript: nagłówek Tampermonkey i poprawna składnia', () => {
   assert.match(src, new RegExp(`@version\\s+${version.replace(/\./g, '\\.')}`));
   assert.match(src, /@match\s+https:\/\/salescenter\.allegro\.com\/\*/);
   assert.match(src, /@connect\s+generativelanguage\.googleapis\.com/);
+  assert.match(src, /@connect\s+api\.anthropic\.com/);
+  assert.match(src, /@connect\s+\*\n/);
+  assert.match(src, /root\.AllegroClaude = api/);
   assert.doesNotThrow(() => new vm.Script(src));
 });

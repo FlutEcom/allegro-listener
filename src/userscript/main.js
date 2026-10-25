@@ -1,9 +1,10 @@
 /**
  * Panel wtyczki na salescenter.allegro.com/offer…
- * Zdjęcie + nazwa (albo dane z katalogu) → jedno kliknięcie → Gemini: słowa kluczowe, tytuł, opis
- * wg reguł z rules/ → wstawienie tytułu do formularza, kopiowanie sekcji opisu.
+ * Zdjęcie + nazwa (albo dane z katalogu) → jedno kliknięcie → Gemini: słowa kluczowe i tytuł,
+ * Claude Opus (przez bramkę, jeśli ustawiony) albo Gemini: opis wg reguł z rules/
+ * → wstawienie tytułu i opisu do formularza.
  *
- * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroListing)
+ * Moduły (AllegroTitleRules, AllegroDescriptionRules, AllegroGemini, AllegroClaude, AllegroListing)
  * dostarcza scripts/build.js w obiekcie `self`.
  */
 /* global GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_setClipboard */
@@ -12,6 +13,7 @@
 const T = self.AllegroTitleRules;
 const D = self.AllegroDescriptionRules;
 const G = self.AllegroGemini;
+const C = self.AllegroClaude;
 const L = self.AllegroListing;
 
 const OFFER_PATH = /^\/offer/;
@@ -26,11 +28,25 @@ const settings = {
   get model() { return GM_getValue('model', '') || DEFAULT_MODEL; },
   get caseStyle() { return GM_getValue('caseStyle', 'AUTO'); },
   get search() { return GM_getValue('search', true); },
+  get claudeOn() { return GM_getValue('claudeOn', true); },
+  get claudeKey() { return GM_getValue('claudeKey', ''); },
+  get claudeUrl() { return GM_getValue('claudeUrl', ''); },
+  get claudeModel() { return GM_getValue('claudeModel', '') || C.DEFAULT_MODEL; },
+  get claudeAuth() { return GM_getValue('claudeAuth', 'AUTO'); },
+  get claudeEffort() { return GM_getValue('claudeEffort', C.DEFAULT_EFFORT); },
+  /** Opis pisze Claude, gdy jest włączony i ma klucz. */
+  get useClaude() { return this.claudeOn && !!this.claudeKey; },
   save(values) {
     GM_setValue('apiKey', values.apiKey.trim());
     GM_setValue('model', values.model.trim().replace(/^models\//, ''));
     GM_setValue('caseStyle', values.caseStyle);
     GM_setValue('search', values.search);
+    GM_setValue('claudeOn', values.claudeOn);
+    GM_setValue('claudeKey', values.claudeKey.trim());
+    GM_setValue('claudeUrl', values.claudeUrl.trim());
+    GM_setValue('claudeModel', values.claudeModel.trim());
+    GM_setValue('claudeAuth', values.claudeAuth);
+    GM_setValue('claudeEffort', values.claudeEffort);
   },
 };
 
@@ -48,7 +64,7 @@ const state = {
 function gm(req) {
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
-      timeout: 180000,
+      timeout: 300000,
       ...req,
       onload: resolve,
       onerror: () => reject(new Error(`Brak połączenia: ${new URL(req.url).host}`)),
@@ -69,6 +85,26 @@ function ask() {
     transport: gmTransport,
     onSearch: (q) => { state.searchQueries = q; },
   });
+}
+
+/** Autor opisu: Claude przez bramkę (albo api.anthropic.com); undefined = opis pisze Gemini. */
+function claudeAsk(overrides) {
+  const cfg = {
+    apiKey: settings.claudeKey,
+    model: settings.claudeModel,
+    baseUrl: settings.claudeUrl,
+    auth: settings.claudeAuth,
+    effort: settings.claudeEffort,
+    ...overrides,
+  };
+  const fn = C.createAsk({
+    ...cfg,
+    transport: gmTransport,
+    // AUTO wykrył, że bramka chce Authorization: Bearer – zapamiętaj, żeby nie tracić zapytania następnym razem
+    onAuth: (auth) => { if (cfg.auth === 'AUTO' && !overrides) GM_setValue('claudeAuth', auth); },
+  });
+  fn.label = 'Claude';
+  return fn;
 }
 
 // ---------- zdjęcia ----------
@@ -357,6 +393,7 @@ textarea { min-height: 54px; resize: vertical; }
 .card { border: 1px solid #ddd; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
 .card.ok { border-color: #2a9d4b; }
 h3 { font-size: 14px; margin: 18px 0 4px; border-top: 1px solid #eee; padding-top: 12px; }
+h3:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { background: #f0f0f0; border-radius: 12px; padding: 2px 8px; }
 .chip.top { background: #ff5a00; color: #fff; }
@@ -417,7 +454,8 @@ function buildUi() {
       el('button', { class: 'btn', on: { click: insertTitle } }, 'Wstaw do formularza'),
       el('button', { class: 'btn sec', on: { click: () => copy($('title').value) } }, 'Kopiuj'),
       el('details', {}, el('summary', { id: 'altTitlesSummary' }, 'Inne propozycje'), el('div', { id: 'altTitles' })),
-      el('h3', {}, 'Opis'),
+      el('h3', {}, 'Opis ', el('small', { id: 'descEngine' })),
+      el('div', { class: 'hint', id: 'descEngineError', hidden: true }),
       el('div', { class: 'row' },
         el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'smallParts', on: { change: refreshDescription } }), 'Małe elementy (ostrzeżenie 36 mies.)'),
         el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'isNew', checked: true, on: { change: refreshDescription } }), 'Produkt nowy'),
@@ -432,6 +470,7 @@ function buildUi() {
 
   // --- Ustawienia ---
   const settingsTab = el('div', { id: 'tab-settings', hidden: true },
+    el('h3', {}, 'Gemini – produkt, słowa kluczowe i tytuł'),
     el('label', { for: 'apiKey' }, 'Klucz API Gemini ', el('small', {}, '– zapisywany tylko w Tampermonkey na tym komputerze')),
     el('input', { type: 'password', id: 'apiKey', value: settings.apiKey }),
     el('label', { for: 'model' }, 'Model Gemini ', el('small', {}, `– domyślnie ${DEFAULT_MODEL}`)),
@@ -444,8 +483,30 @@ function buildUi() {
       el('option', { value: 'TITLE' }, 'Zawsze Pierwsze Litery Wielkie')),
     el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'search', checked: settings.search }),
       'Szukaj słów kluczowych w Google (Trends, Allegro) – dokładniej, ale wolniej'),
-    el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz'),
     el('button', { class: 'btn sec', on: { click: loadModels } }, 'Pobierz listę modeli'),
+    el('h3', {}, 'Claude Opus – opis'),
+    el('label', { class: 'check' }, el('input', { type: 'checkbox', id: 'claudeOn', checked: settings.claudeOn }),
+      'Opis pisze Claude (bez klucza Claude opis pisze Gemini)'),
+    el('label', { for: 'claudeKey' }, 'Klucz API Claude / bramki ', el('small', {}, '– zapisywany tylko w Tampermonkey na tym komputerze')),
+    el('input', { type: 'password', id: 'claudeKey', value: settings.claudeKey }),
+    el('label', { for: 'claudeUrl' }, 'Adres bramki ', el('small', {}, `– np. adres bramki vivo; puste = ${C.DEFAULT_BASE_URL}`)),
+    el('input', { type: 'text', id: 'claudeUrl', value: settings.claudeUrl, placeholder: C.DEFAULT_BASE_URL }),
+    el('label', { for: 'claudeModel' }, 'Model Claude ', el('small', {}, `– domyślnie ${C.DEFAULT_MODEL}`)),
+    el('input', { type: 'text', id: 'claudeModel', value: settings.claudeModel, list: 'claudeModelList' }),
+    el('datalist', { id: 'claudeModelList' }),
+    el('label', { for: 'claudeAuth' }, 'Logowanie do bramki'),
+    el('select', { id: 'claudeAuth' },
+      el('option', { value: 'AUTO' }, 'AUTO – wykryj samo'),
+      el('option', { value: 'X_API_KEY' }, 'Nagłówek x-api-key (jak Anthropic)'),
+      el('option', { value: 'BEARER' }, 'Authorization: Bearer')),
+    el('label', { for: 'claudeEffort' }, 'Staranność opisu'),
+    el('select', { id: 'claudeEffort' },
+      el('option', { value: 'low' }, 'Szybko (low)'),
+      el('option', { value: 'medium' }, 'Standard (medium)'),
+      el('option', { value: 'high' }, 'Dokładnie, ale wolniej (high)')),
+    el('button', { class: 'btn sec', on: { click: loadClaudeModels } }, 'Pobierz modele Claude'),
+    el('button', { class: 'btn sec', on: { click: testClaude } }, 'Sprawdź połączenie z Claude'),
+    el('div', {}, el('button', { class: 'btn', on: { click: saveSettings } }, 'Zapisz')),
     el('button', { class: 'btn sec', on: { click: () => {
       copy(describeDescriptionDom());
       setStatus('settingsStatus', 'Skopiowano budowę edytora opisu (bez treści). Wklej ją w rozmowie z autorem wtyczki.');
@@ -453,6 +514,8 @@ function buildUi() {
     el('div', { class: 'status', id: 'settingsStatus' }),
   );
   settingsTab.querySelector('#caseStyle').value = settings.caseStyle;
+  settingsTab.querySelector('#claudeAuth').value = settings.claudeAuth;
+  settingsTab.querySelector('#claudeEffort').value = settings.claudeEffort;
 
   const tabs = { gen: ['Generuj', genTab], settings: ['Ustawienia', settingsTab] };
   const nav = el('nav', {}, ...Object.entries(tabs).map(([key, [label]]) =>
@@ -611,7 +674,10 @@ function buildUi() {
         allowWords: $('allowWords').value.split(',').map((s) => s.trim()).filter(Boolean),
         date: new Date(),
       };
-      state.result = await L.generateListing(input, ask(), { onProgress: (m) => { phase = m; tick(); } });
+      state.result = await L.generateListing(input, ask(), {
+        describe: settings.useClaude ? claudeAsk() : undefined,
+        onProgress: (m) => { phase = m; tick(); },
+      });
       renderResult();
       const secs = Math.round((Date.now() - started) / 1000);
       const r = state.result;
@@ -640,6 +706,12 @@ function buildUi() {
         el('div', { class: 'muted' }, `${t.length} znaków${t.ok ? ' · ✔ OK' : ''}`),
         el('ul', { class: 'msgs' }, ...t.errors.map((m) => el('li', { class: 'e' }, m))),
         el('button', { class: 'btn small', on: { click: () => { $('title').value = t.title; refreshDescription(); } } }, 'Wybierz'))));
+    const d = r.description;
+    $('descEngine').textContent = d.engine === 'describe' ? `– napisał Claude (${settings.claudeModel})` : '– napisał Gemini';
+    $('descEngineError').hidden = !d.engineError;
+    $('descEngineError').textContent = d.engineError
+      ? (d.engine === 'describe' ? `Claude nie dokończył poprawek: ${d.engineError}` : `Claude nie odpowiedział, więc opis napisał Gemini. Błąd: ${d.engineError}`)
+      : '';
     $('smallParts').checked = !!r.descInput.smallParts;
     $('isNew').checked = r.descInput.condition === 'NEW';
     refreshDescription();
@@ -712,8 +784,22 @@ function buildUi() {
   }
 
   // --- ustawienia ---
+  function claudeForm() {
+    return {
+      apiKey: $('claudeKey').value.trim() || settings.claudeKey,
+      model: $('claudeModel').value.trim() || C.DEFAULT_MODEL,
+      baseUrl: $('claudeUrl').value.trim(),
+      auth: $('claudeAuth').value,
+      effort: $('claudeEffort').value,
+    };
+  }
+
   function saveSettings() {
-    settings.save({ apiKey: $('apiKey').value, model: $('model').value, caseStyle: $('caseStyle').value, search: $('search').checked });
+    settings.save({
+      apiKey: $('apiKey').value, model: $('model').value, caseStyle: $('caseStyle').value, search: $('search').checked,
+      claudeOn: $('claudeOn').checked, claudeKey: $('claudeKey').value, claudeUrl: $('claudeUrl').value,
+      claudeModel: $('claudeModel').value, claudeAuth: $('claudeAuth').value, claudeEffort: $('claudeEffort').value,
+    });
     setStatus('settingsStatus', 'Zapisano.');
     if (settings.apiKey) setTimeout(() => showTab('gen'), 600);
   }
@@ -724,6 +810,28 @@ function buildUi() {
       const models = await G.listModels({ apiKey: $('apiKey').value.trim() || settings.apiKey, transport: gmTransport });
       $('modelList').replaceChildren(...models.map((m) => el('option', { value: m })));
       setStatus('settingsStatus', `Dostępne modele (${models.length}): kliknij pole „Model” i wybierz. Np. ${models.filter((m) => /flash/.test(m)).slice(-3).join(', ')}`);
+    } catch (e) {
+      setStatus('settingsStatus', e.message, true);
+    }
+  }
+
+  async function loadClaudeModels() {
+    setStatus('settingsStatus', 'Pobieram modele z bramki…');
+    try {
+      const models = await C.listModels({ ...claudeForm(), transport: gmTransport });
+      $('claudeModelList').replaceChildren(...models.map((m) => el('option', { value: m })));
+      setStatus('settingsStatus', `Modele Claude (${models.length}): kliknij pole „Model Claude” i wybierz. Np. ${models.filter((m) => /opus/.test(m)).slice(-3).join(', ')}`);
+    } catch (e) {
+      setStatus('settingsStatus', e.message, true);
+    }
+  }
+
+  async function testClaude() {
+    const cfg = claudeForm();
+    setStatus('settingsStatus', `Sprawdzam połączenie z ${C.messagesUrl(cfg.baseUrl)}…`);
+    try {
+      const res = await claudeAsk(cfg)('Sprawdzenie połączenia. Odpowiedz JSON-em {"ok": true}.', { type: 'OBJECT', properties: { ok: { type: 'BOOLEAN' } }, required: ['ok'] });
+      setStatus('settingsStatus', res && res.ok ? `Claude działa (${cfg.model}). Kliknij Zapisz.` : 'Claude odpowiedział, ale nie tak, jak trzeba – sprawdź model.', !(res && res.ok));
     } catch (e) {
       setStatus('settingsStatus', e.message, true);
     }
